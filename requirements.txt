@@ -1,0 +1,35 @@
+# ── Core ─────────────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.9
+
+# ── LLM providers ─────────────────────────────────────────────────────────────
+groq>=0.9.0
+openai>=1.30.0
+
+# ── Graph ─────────────────────────────────────────────────────────────────────
+neo4j>=5.0.0
+
+# ── Vector store ─────────────────────────────────────────────────────────────
+qdrant-client>=1.9.0
+
+# ── Embeddings / reranker ─────────────────────────────────────────────────────
+sentence-transformers>=2.6.0
+FlagEmbedding>=1.2.0
+torch>=2.2.0
+
+# ── PDF ingestion ─────────────────────────────────────────────────────────────
+PyMuPDF>=1.23.0       # fitz
+
+# ── Entity deduplication ──────────────────────────────────────────────────────
+rapidfuzz>=3.6.0
+
+# ── Identifier linking (Phase 2) ──────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Optional: scispaCy zero-API entity spotter (Phase 5) ──────────────────────
+# pip install scispacy
+# python -m spacy download en_core_sci_sm
+# (comment out if not needed — ~350MB model)
