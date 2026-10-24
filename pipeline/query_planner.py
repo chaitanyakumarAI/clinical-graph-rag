@@ -23,13 +23,10 @@ Intent-Aware Enhancement:
 """
 
 from __future__ import annotations
-import json
-import os
 from typing import List, Literal
 from pydantic import BaseModel, field_validator
-from dotenv import load_dotenv
 
-load_dotenv()
+from llm import RateLimitExhausted, chat_json
 
 Route = Literal["vector_only", "hybrid_single", "hybrid_multi", "gds_augmented"]
 
@@ -131,7 +128,7 @@ def plan_query(
 
     Args:
         query:          The user's medical question
-        provider:       "auto" | "groq" | "openai"
+        provider:       "auto" | "gemini" | "groq" | "openai" | "ollama"
         context_chunks: Retrieved chunk snippets for entity grounding (Phase 5)
 
     Returns:
@@ -146,10 +143,8 @@ def plan_query(
             f"---\n{snippet}\n---"
         )
 
-    raw = _call_llm(user_content, provider)
-
     try:
-        data = json.loads(raw)
+        data = chat_json(SYSTEM_PROMPT, user_content, provider=provider, max_tokens=400)
         # Normalize route names for backward compatibility
         route = data.get("route", "hybrid_single")
         route = _normalize_route(route)
@@ -157,8 +152,10 @@ def plan_query(
         # Validate relation types against allowed list
         data["target_relations"] = _validate_relations(data.get("target_relations", []))
         return QueryPlan(**data)
+    except RateLimitExhausted:
+        raise   # no point continuing — the answer step would fail too
     except Exception as e:
-        print(f"[query_planner] Parse failed ({e}), defaulting to hybrid_multi")
+        print(f"[query_planner] Planning failed ({e}), defaulting to hybrid_multi")
         return QueryPlan(
             route="hybrid_multi",
             reason="Classification failed — defaulting to hybrid_multi for safety",
@@ -187,44 +184,6 @@ def _normalize_route(route: str) -> str:
         "multi_hop":   "hybrid_multi",
     }
     return mapping.get(route, route)
-
-
-def _call_llm(user_content: str, provider: str) -> str:
-    if provider == "groq" or (provider == "auto" and os.getenv("GROQ_API_KEY")):
-        return _call_groq(user_content)
-    return _call_openai(user_content)
-
-
-def _call_groq(user_content: str) -> str:
-    from groq import Groq
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_content},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.0,
-        max_tokens=400,
-    )
-    return resp.choices[0].message.content
-
-
-def _call_openai(user_content: str) -> str:
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_content},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.0,
-        max_tokens=400,
-    )
-    return resp.choices[0].message.content
 
 
 if __name__ == "__main__":

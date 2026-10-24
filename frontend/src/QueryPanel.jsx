@@ -109,6 +109,11 @@ export function QueryPanel({ onQueryResult }) {
         }),
       })
       const data = await res.json()
+      if (!res.ok) {
+        // e.g. 429 = LLM rate limit used up, 502 = bad API key / model
+        setError(data.detail || `Request failed (HTTP ${res.status})`)
+        return
+      }
       setResult(data)
       onQueryResult?.(data)
     } catch {

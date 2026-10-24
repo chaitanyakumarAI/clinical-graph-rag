@@ -390,6 +390,13 @@ class Neo4jClient:
         with self.driver.session() as s:
             return [r.data() for r in s.run(cypher, params or {})]
 
+    def run_read_query(self, cypher: str, params: Dict = None) -> List[Dict]:
+        """Run a query in a READ transaction — Neo4j refuses any write in it."""
+        with self.driver.session() as s:
+            return s.execute_read(
+                lambda tx: [r.data() for r in tx.run(cypher, params or {})]
+            )
+
     def get_node_counts(self) -> Dict[str, int]:
         counts = {}
         with self.driver.session() as s:

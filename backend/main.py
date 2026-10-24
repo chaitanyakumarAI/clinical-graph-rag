@@ -24,10 +24,12 @@ from __future__ import annotations
 import os
 import sys
 import time
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+import openai
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -35,15 +37,11 @@ from dotenv import load_dotenv
 load_dotenv()
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from graph.neo4j_client         import Neo4jClient
+from graph.neo4j_client         import Neo4jClient, NODE_LABELS
+from llm                        import RateLimitExhausted
 from pipeline.query_planner     import plan_query
-from pipeline.entity_linker     import link_entities
-from pipeline.graph_retriever   import (
-    retrieve_subgraph,
-    retrieve_graph_context,
-    format_subgraph_for_context,
-    format_for_context as graph_ctx,
-)
+from pipeline.entity_linker     import link_entities, invalidate_cache as invalidate_entity_cache
+from pipeline.graph_retriever   import retrieve_subgraph, format_subgraph_for_context
 from pipeline.vector_retriever  import retrieve_vector_context
 from pipeline.reranker          import fuse_and_rerank
 from pipeline.generator         import generate_answer
@@ -69,6 +67,35 @@ app.add_middleware(
 _FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.isdir(_FRONTEND_DIST):
     app.mount("/app", StaticFiles(directory=_FRONTEND_DIST, html=True), name="frontend")
+
+@app.exception_handler(RateLimitExhausted)
+def rate_limit_exhausted_handler(_request: Request, exc: RateLimitExhausted):
+    """Turn an exhausted LLM quota into a clear 429 instead of a generic 500."""
+    retry_hint = (f" Try again in about {exc.wait_seconds / 60:.0f} minutes."
+                  if exc.wait_seconds else " Try again later.")
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": f"The {exc.provider} LLM rate limit is used up.{retry_hint} "
+                      "For ingestion, chunks finished so far are cached and will be "
+                      "skipped on the next upload.",
+            "provider": exc.provider,
+            "retry_after_seconds": exc.wait_seconds,
+        },
+    )
+
+
+@app.exception_handler(openai.APIStatusError)
+def llm_api_error_handler(_request: Request, exc: openai.APIStatusError):
+    """Invalid API key, unknown model, etc. — tell the user what the provider said."""
+    hints = {401: " Check the API key in .env.",
+             404: " Check the model name (<PROVIDER>_MODEL) in .env."}
+    return JSONResponse(
+        status_code=502,
+        content={"detail": f"LLM provider error ({exc.status_code}): {exc.message}."
+                           f"{hints.get(exc.status_code, '')}"},
+    )
+
 
 # Shared Neo4j client (connection pool)
 _neo4j: Optional[Neo4jClient] = None
@@ -161,6 +188,8 @@ def query(req: QueryRequest):
             chunk_entity_names = spot_entities_in_chunks(
                 vector_results, provider=req.provider
             )
+        except RateLimitExhausted:
+            raise
         except Exception as e:
             print(f"[main] entity_extractor_lite failed: {e}")
 
@@ -353,22 +382,31 @@ def query(req: QueryRequest):
     )
 
 
+# Plain `def` (not `async def`): ingestion blocks for minutes, so FastAPI must
+# run it in a worker thread or every other request would freeze meanwhile.
 @app.post("/ingest")
-async def ingest(
-    file:       UploadFile = File(...),
-    provider:   str        = Query("auto"),
-    link_ids:   bool       = Query(False,  description="Phase 2: link UMLS/MeSH/RxNorm IDs"),
-    valid_from: str        = Query("",     description="Phase 2: ISO date validity start"),
-    valid_until: str       = Query("",     description="Phase 2: ISO date validity end"),
+def ingest(
+    file:         UploadFile = File(...),
+    provider:     str        = Query("auto", description="LLM provider: auto, gemini, groq, openai, ollama"),
+    chunk_tokens: int        = Query(512, ge=128, le=4096,
+                                     description="Chunk size in tokens. 1024 halves the LLM calls for long PDFs"),
+    link_ids:     bool       = Query(False,  description="Phase 2: link UMLS/MeSH/RxNorm IDs"),
+    valid_from:   str        = Query("",     description="Phase 2: ISO date validity start"),
+    valid_until:  str        = Query("",     description="Phase 2: ISO date validity end"),
 ):
-    """Upload a PDF, run full Stage 1 pipeline, store in Neo4j + Qdrant."""
+    """
+    Upload a PDF, run full Stage 1 pipeline, store in Neo4j + Qdrant.
+
+    If the LLM quota runs out midway, responds 429 and nothing is written;
+    finished chunks stay cached, so uploading the same PDF again resumes.
+    """
     import tempfile, hashlib
 
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     t0           = time.time()
-    file_bytes   = await file.read()
+    file_bytes   = file.file.read()
     sha256       = hashlib.sha256(file_bytes).hexdigest()
     neo4j        = get_neo4j()
 
@@ -395,11 +433,13 @@ async def ingest(
         from graph.graph_loader         import load_to_graph, load_chunks_to_qdrant
 
         pages   = parse_pdf(tmp_path)
-        chunks  = chunk_pages(pages)
-        chunks  = embed_chunks(chunks)
+        chunks  = chunk_pages(pages, chunk_tokens=chunk_tokens)
 
+        # LLM extraction first: it is the step that can hit rate limits, and if
+        # it does we want to stop before anything is written to Neo4j/Qdrant.
         results             = extract_from_chunks(chunks, provider=provider)
         entities, relations = deduplicate(results)
+        chunks              = embed_chunks(chunks)
 
         # Phase 2: optional identifier linking
         if link_ids:
@@ -444,6 +484,8 @@ async def ingest(
             entity_count   = counts["entities"],
             relation_count = counts["relations"],
         )
+
+        invalidate_entity_cache()   # let queries link the newly added entities
 
         latency = (time.time() - t0) * 1000
         return {
@@ -494,18 +536,31 @@ def delete_document(sha256: str):
 
     neo4j = get_neo4j()
 
+    # Qdrant points are tagged with the chunk "source" (the temp-file name used
+    # at upload time), not the original filename — collect those before the
+    # chunks are deleted from Neo4j.
+    chunk_sources = [
+        row["source"] for row in neo4j.run_query(
+            "MATCH (:Document {sha256: $sha256})-[:HAS_CHUNK]->(c:Chunk) "
+            "RETURN DISTINCT c.source AS source",
+            {"sha256": sha256},
+        ) if row.get("source")
+    ]
+
     # Step 1: purge Neo4j data
     neo4j_result = _delete_neo4j(sha256, neo4j)
     if neo4j_result.get("error"):
         raise HTTPException(status_code=404, detail=neo4j_result["error"])
 
     filename = neo4j_result["filename"]
+    invalidate_entity_cache()
 
     # Step 2: purge Qdrant embeddings for this document
     qdrant_deleted = 0
     try:
         store = QdrantStore()
-        qdrant_deleted = store.delete_by_source(filename)
+        for source in chunk_sources or [filename]:
+            qdrant_deleted += store.delete_by_source(source)
     except Exception as e:
         print(f"[delete_document] Qdrant purge failed (non-fatal): {e}")
 
@@ -532,6 +587,11 @@ def graph_explore(
     min_conf:     float         = Query(0.0,  description="Min node confidence filter"),
 ):
     """Browse graph nodes and their direct relationships."""
+    # The label is inserted into the Cypher text, so only allow known labels.
+    allowed_labels = NODE_LABELS + ["Document", "Chunk", "Evidence"]
+    if label and label not in allowed_labels:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown label '{label}'. Valid: {', '.join(allowed_labels)}")
     neo4j = get_neo4j()
 
     label_filter = f":{label}" if label else ""

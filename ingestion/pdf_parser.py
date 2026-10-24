@@ -4,7 +4,6 @@ Stage 1 — Parse medical PDFs into per-page text using PyMuPDF.
 """
 
 from __future__ import annotations
-import os
 from pathlib import Path
 from typing import List, Dict
 import fitz  # PyMuPDF

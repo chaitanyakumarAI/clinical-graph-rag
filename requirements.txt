@@ -6,7 +6,7 @@ python-dotenv>=1.0.0
 python-multipart>=0.0.9
 
 # ── LLM providers ─────────────────────────────────────────────────────────────
-groq>=0.9.0
+# Gemini, Groq, OpenAI and Ollama are all reached through the OpenAI-compatible API
 openai>=1.30.0
 
 # ── Graph ─────────────────────────────────────────────────────────────────────

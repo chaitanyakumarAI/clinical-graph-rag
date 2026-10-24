@@ -8,7 +8,7 @@ Used by cypher_generator.py to build accurate LLM prompts.
 
 from __future__ import annotations
 import time
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from graph.neo4j_client import Neo4jClient

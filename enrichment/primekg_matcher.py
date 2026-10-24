@@ -14,7 +14,7 @@ Download: https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/D
 from __future__ import annotations
 import csv
 import os
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from rapidfuzz import fuzz, process as rfprocess
 
 FUZZY_THRESHOLD = int(os.getenv("PRIMEKG_FUZZY_THRESHOLD", "88"))

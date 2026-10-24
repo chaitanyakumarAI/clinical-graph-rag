@@ -2,8 +2,16 @@
 ingestion/entity_extractor.py
 Stage 1 — LLM-assisted entity and relation extraction from text chunks.
 
-Defaults to Groq (Llama 3.3-70B, free tier).
-Falls back to OpenAI GPT-4o if GROQ_API_KEY is absent.
+The LLM provider (Gemini / Groq / OpenAI / local Ollama) is chosen in
+llm/client.py, which also handles rate limiting and retries.
+
+Long PDFs on free-tier APIs:
+  - Every chunk's result is cached on disk (.cache/extractions/), so if a run
+    stops because the daily quota is used up, re-running resumes where it
+    stopped instead of paying for the same chunks again.
+  - Set EXTRACTION_MODEL to use a cheaper/higher-quota model just for bulk
+    extraction (e.g. llama-3.1-8b-instant on Groq) while answers still use
+    the default model.
 
 Phase 1 enhancements:
   - Expanded entity schema: +Gene, Protein, Pathway, Compound, CellType,
@@ -15,12 +23,18 @@ Phase 1 enhancements:
 """
 
 from __future__ import annotations
+import hashlib
 import json
 import os
-import time
+import re
 from typing import List, Dict, Optional
+
+import openai
 from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
+
+from ingestion.ontology_validator import validate_triple as _validate_triple
+from llm import RateLimitExhausted, chat_json
 
 load_dotenv()
 
@@ -103,9 +117,6 @@ class ExtractionResult(BaseModel):
 MIN_ENTITY_CONFIDENCE   = 0.40
 MIN_RELATION_CONFIDENCE = 0.50
 
-from ingestion.ontology_validator import validate_triple as _validate_triple
-import re as _re
-
 
 def _is_grounded(name: str, aliases: List[str], text: str) -> bool:
     """
@@ -124,7 +135,7 @@ def _is_grounded(name: str, aliases: List[str], text: str) -> bool:
         if alias and alias.lower() in text_l:
             return True
     # Fuzzy: require all significant words (≥4 chars) to appear
-    words = [w for w in _re.split(r'\W+', name.lower()) if len(w) >= 4]
+    words = [w for w in re.split(r'\W+', name.lower()) if len(w) >= 4]
     if len(words) >= 2 and all(w in text_l for w in words):
         return True
     return False
@@ -207,176 +218,182 @@ USER_PROMPT_TEMPLATE = """Extract all medical entities and relationships from th
 
 Return ONLY valid JSON matching the schema. If nothing relevant is found, return {{"entities": [], "relations": []}}."""
 
+# Output budget per chunk. Providers count max_tokens against the per-minute
+# token limit, so a smaller value lets more chunks through per minute.
+EXTRACTION_MAX_TOKENS = int(os.getenv("EXTRACTION_MAX_TOKENS", 2048))
 
-# ── LLM Clients ───────────────────────────────────────────────────────────────
-
-def _call_groq(text: str) -> dict:
-    from groq import Groq
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": USER_PROMPT_TEMPLATE.format(text=text)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.0,
-        max_tokens=4096,
-    )
-    return json.loads(response.choices[0].message.content)
+# Retries for a malformed (non-JSON) reply. Rate limits are retried in llm/.
+MALFORMED_REPLY_RETRIES = 1
 
 
-def _call_openai(text: str) -> dict:
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": USER_PROMPT_TEMPLATE.format(text=text)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.0,
-        max_tokens=4096,
-    )
-    return json.loads(response.choices[0].message.content)
+# ── Disk cache (lets an interrupted long-PDF run resume for free) ─────────────
 
+CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache", "extractions"
+)
+
+
+def _cache_path(text: str) -> str:
+    digest = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:16]
+    return os.path.join(CACHE_DIR, f"{digest}.json")
+
+
+def _load_cached(text: str) -> Optional[dict]:
+    """Return the cached {"entities": [...], "relations": [...]} for this text, if any."""
+    path = _cache_path(text)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_cached(text: str, entities: List[ExtractedEntity],
+                 relations: List[ExtractedRelation]) -> None:
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(_cache_path(text), "w", encoding="utf-8") as f:
+            json.dump({
+                "entities":  [e.model_dump() for e in entities],
+                "relations": [r.model_dump() for r in relations],
+            }, f, indent=2)
+    except OSError as e:
+        print(f"  [cache] warning: could not save cache: {e}")
+
+
+# ── LLM call + validation ─────────────────────────────────────────────────────
 
 def _call_llm(text: str, provider: str = "auto") -> dict:
-    """Call LLM with auto-detection of available provider."""
-    if provider == "groq" or (provider == "auto" and os.getenv("GROQ_API_KEY")):
-        return _call_groq(text)
-    elif provider == "openai" or (provider == "auto" and os.getenv("OPENAI_API_KEY")):
-        return _call_openai(text)
-    else:
-        raise EnvironmentError(
-            "No LLM API key found. Set GROQ_API_KEY or OPENAI_API_KEY in .env"
-        )
+    return chat_json(
+        SYSTEM_PROMPT,
+        USER_PROMPT_TEMPLATE.format(text=text),
+        provider=provider,
+        model=os.getenv("EXTRACTION_MODEL") or None,
+        max_tokens=EXTRACTION_MAX_TOKENS,
+    )
+
+
+def _parse_and_validate(raw: dict, text: str):
+    """Turn raw LLM JSON into validated entities and relations."""
+    entities_raw: List[ExtractedEntity] = []
+    for e in raw.get("entities", []):
+        try:
+            entities_raw.append(ExtractedEntity(**e))
+        except Exception:
+            pass   # unknown type / malformed item — skip it
+
+    relations_raw: List[ExtractedRelation] = []
+    for r in raw.get("relations", []):
+        try:
+            relations_raw.append(ExtractedRelation(**r))
+        except Exception:
+            pass
+
+    entities = [
+        ent for ent in entities_raw
+        if ent.confidence >= MIN_ENTITY_CONFIDENCE          # 1. confidence threshold
+        and _is_grounded(ent.name, ent.aliases, text)       # 2. must appear in the text
+    ]
+    relations = [
+        rel for rel in relations_raw
+        if rel.confidence >= MIN_RELATION_CONFIDENCE        # 3. confidence threshold
+        and _is_type_consistent(rel)                        # 4. ontology-valid triple
+    ]
+
+    if len(entities) < len(entities_raw) or len(relations) < len(relations_raw):
+        print(f"  [validate] entities {len(entities_raw)}→{len(entities)}, "
+              f"relations {len(relations_raw)}→{len(relations)}")
+    return entities, relations
 
 
 # ── Main Extractor ────────────────────────────────────────────────────────────
 
 def extract_from_chunk(
-    chunk: Dict,
-    provider: str = "auto",
-    retry: int = 2,
-    delay: float = 1.0,
+    chunk:     Dict,
+    provider:  str = "auto",
+    use_cache: bool = True,
 ) -> ExtractionResult:
     """
     Run LLM extraction on a single chunk dict.
 
     Args:
-        chunk:    A chunk dict from chunker.chunk_pages()
-        provider: "auto" | "groq" | "openai"
-        retry:    Number of retries on failure
-        delay:    Seconds between retries
+        chunk:     A chunk dict from chunker.chunk_pages()
+        provider:  "auto" | "gemini" | "groq" | "openai" | "ollama"
+        use_cache: Reuse / store results in .cache/extractions/
 
     Returns:
-        ExtractionResult with validated entities and relations, plus provenance
-    """
-    text            = chunk["text"]
-    chunk_id        = chunk["chunk_id"]
-    source          = chunk["source"]
-    page            = chunk.get("page", 0)
-    chunk_index     = chunk.get("chunk_index", 0)
+        ExtractionResult with validated entities and relations, plus provenance.
+        Empty if the LLM keeps returning unusable JSON for this chunk.
 
-    for attempt in range(retry + 1):
+    Raises:
+        RateLimitExhausted: the provider's quota is used up — stop the whole run.
+        openai.APIError:    e.g. invalid API key or unknown model — also fatal.
+    """
+    text   = chunk["text"]
+    result = ExtractionResult(
+        chunk_id        = chunk["chunk_id"],
+        source          = chunk["source"],
+        page            = chunk.get("page", 0),
+        paragraph_index = chunk.get("chunk_index", 0),
+    )
+
+    cached = _load_cached(text) if use_cache else None
+    if cached is not None:
+        result.entities  = [ExtractedEntity(**e)   for e in cached.get("entities", [])]
+        result.relations = [ExtractedRelation(**r) for r in cached.get("relations", [])]
+        return result
+
+    # Only a bad reply (invalid / truncated JSON) is worth retrying here.
+    # Anything else — exhausted quota, wrong API key, unknown model — would
+    # fail the same way for every chunk, so it propagates and stops the run.
+    for attempt in range(MALFORMED_REPLY_RETRIES + 1):
         try:
             raw = _call_llm(text, provider)
-            entities_raw  = []
-            relations_raw = []
+            break
+        except (ValueError, openai.BadRequestError) as exc:
+            if attempt == MALFORMED_REPLY_RETRIES:
+                print(f"\n  [extractor] Skipping chunk {result.chunk_id}: {exc}")
+                return result
+            print(f"\n  [extractor] Bad reply for chunk {result.chunk_id} ({exc}), retrying …")
 
-            for e in raw.get("entities", []):
-                try:
-                    entities_raw.append(ExtractedEntity(**e))
-                except Exception:
-                    pass
-
-            for r in raw.get("relations", []):
-                try:
-                    relations_raw.append(ExtractedRelation(**r))
-                except Exception:
-                    pass
-
-            # ── Validation pass ───────────────────────────────────────────────
-            entities: List[ExtractedEntity] = []
-            for ent in entities_raw:
-                # 1. Confidence threshold
-                if ent.confidence < MIN_ENTITY_CONFIDENCE:
-                    continue
-                # 2. Text grounding — name (or alias) must appear in chunk
-                if not _is_grounded(ent.name, ent.aliases, text):
-                    continue
-                entities.append(ent)
-
-            valid_names = {e.name.lower() for e in entities}
-            relations: List[ExtractedRelation] = []
-            for rel in relations_raw:
-                # 3. Confidence threshold
-                if rel.confidence < MIN_RELATION_CONFIDENCE:
-                    continue
-                # 4. Type-predicate consistency
-                if not _is_type_consistent(rel):
-                    continue
-                relations.append(rel)
-
-            # Stats
-            n_ent_raw  = len(entities_raw)
-            n_rel_raw  = len(relations_raw)
-            n_ent_kept = len(entities)
-            n_rel_kept = len(relations)
-            if n_ent_raw > n_ent_kept or n_rel_raw > n_rel_kept:
-                print(f"  [validate] entities {n_ent_raw}→{n_ent_kept}, "
-                      f"relations {n_rel_raw}→{n_rel_kept}")
-
-            return ExtractionResult(
-                entities        = entities,
-                relations       = relations,
-                chunk_id        = chunk_id,
-                source          = source,
-                page            = page,
-                paragraph_index = chunk_index,
-            )
-
-        except Exception as exc:
-            if attempt < retry:
-                time.sleep(delay * (attempt + 1))
-            else:
-                print(f"[extractor] Failed chunk {chunk_id}: {exc}")
-                return ExtractionResult(
-                    chunk_id=chunk_id, source=source,
-                    page=page, paragraph_index=chunk_index,
-                )
+    result.entities, result.relations = _parse_and_validate(raw, text)
+    if use_cache:
+        _save_cached(text, result.entities, result.relations)
+    return result
 
 
 def extract_from_chunks(
-    chunks: List[Dict],
-    provider: str = "auto",
-    rate_limit_delay: float = 0.5,
+    chunks:    List[Dict],
+    provider:  str = "auto",
+    use_cache: bool = True,
 ) -> List[ExtractionResult]:
     """
     Run extraction on all chunks with progress reporting.
 
-    Args:
-        chunks:           Output of chunker.chunk_pages()
-        provider:         LLM provider
-        rate_limit_delay: Seconds between API calls (avoid rate limits)
+    Pacing is automatic (see llm/rate_limiter.py), so there is no fixed delay
+    between calls and cached chunks cost nothing.
 
-    Returns:
-        List of ExtractionResult, one per chunk
+    Raises:
+        RateLimitExhausted: quota used up. Chunks finished so far are cached,
+                            so simply re-running later resumes from here.
     """
-    results = []
-    total   = len(chunks)
+    results: List[ExtractionResult] = []
+    total = len(chunks)
+    print(f"[extractor] Extracting {total} chunks (provider={provider}, cache={use_cache})")
 
     for i, chunk in enumerate(chunks, 1):
         print(f"[extractor] Chunk {i}/{total} (id={chunk['chunk_id']}, "
-              f"page={chunk.get('page',0)}, ~{chunk.get('token_count',0)} tok)", end=" ")
-        result = extract_from_chunk(chunk, provider=provider)
+              f"page={chunk.get('page', 0)}, ~{chunk.get('token_count', 0)} tok)", end=" ")
+        try:
+            result = extract_from_chunk(chunk, provider=provider, use_cache=use_cache)
+        except RateLimitExhausted:
+            print(f"\n[extractor] ⛔ Stopped at chunk {i}/{total}: rate limit exhausted. "
+                  f"{i - 1} chunks are cached — run again later to resume.")
+            raise
         print(f"→ {len(result.entities)} entities, {len(result.relations)} relations")
         results.append(result)
-
-        if i < total:
-            time.sleep(rate_limit_delay)
 
     total_entities  = sum(len(r.entities)  for r in results)
     total_relations = sum(len(r.relations) for r in results)
@@ -401,6 +418,5 @@ if __name__ == "__main__":
             "for patients with severe chronic kidney disease."
         ),
     }
-    result = extract_from_chunk(sample)
-    import json as _json
-    print(_json.dumps(result.model_dump(), indent=2))
+    result = extract_from_chunk(sample, use_cache=False)
+    print(json.dumps(result.model_dump(), indent=2))

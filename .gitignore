@@ -5,3 +5,6 @@
 # Python cache
 __pycache__/
 *.py[cod]
+
+# Per-chunk LLM extraction cache (lets long-PDF runs resume)
+.cache/

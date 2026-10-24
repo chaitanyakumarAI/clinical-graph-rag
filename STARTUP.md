@@ -30,7 +30,7 @@
 
 - **Neo4j** running on `bolt://localhost:7687` (default password: `password`)
 - **Qdrant** running on `http://localhost:6333`
-- **Python venv** with all packages installed (`RAG_VENV` or similar)
+- **Python venv** with all packages installed (`pip install -r requirements.txt`)
 - **Node.js** ≥ 18 (for frontend dev server)
 
 ## Step 1 — Configure `.env`
@@ -44,23 +44,22 @@ NEO4J_PASSWORD=your_neo4j_password
 
 QDRANT_URL=http://localhost:6333
 
-# Choose one LLM provider:
-GROQ_API_KEY=your_groq_api_key
-# or:
-OPENAI_API_KEY=your_openai_api_key
+# Choose an LLM provider (auto-detected in this order: Gemini → Groq → OpenAI):
+GEMINI_API_KEY=your_gemini_api_key   # Generous free tier — best for large PDFs
+GROQ_API_KEY=your_groq_api_key       # gpt-oss-120b — fast, but tight free-tier limits
+OPENAI_API_KEY=your_openai_api_key   # GPT-4o
+# or run a local open-source model with no rate limits at all:
+# LLM_PROVIDER=ollama
+# OLLAMA_MODEL=llama3.1:8b
 ```
+
+All LLM calls go through `llm/client.py` — see **Rate limits** below for tuning.
 
 ## Step 2 — Start Backend
 
 ```bash
-# Option A: Use the start script (auto-detects RAG_VENV)
-./start_backend.sh
-
-# Option B: Explicit venv path
-VENV_PATH=~/RAG_VENV ./start_backend.sh
-
-# Option C: Manual (activate venv first, then from project root)
-source ~/RAG_VENV/bin/activate
+# From the project root, with your venv activated
+source ~/Desktop/RAG_VENV/bin/activate
 uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -70,10 +69,6 @@ uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 ## Step 3 — Start Frontend
 
 ```bash
-# Using the start script
-./start_frontend.sh
-
-# Or manually
 cd frontend
 npm run dev
 ```
@@ -85,7 +80,8 @@ Frontend opens at: **http://localhost:5173**
 1. Open the frontend → **Upload PDF** tab
 2. Drag and drop a medical PDF
 3. Optionally enable **Link UMLS/MeSH/RxNorm IDs**
-4. Click **Ingest PDF**
+4. For long PDFs, enable **Large PDF mode** (1024-token chunks → half the LLM calls)
+5. Click **Ingest PDF**
 
 ## Step 5 — Ask Questions
 
@@ -99,12 +95,64 @@ Frontend opens at: **http://localhost:5173**
 ## Quick Start (both servers in parallel)
 
 ```bash
-# Terminal 1
-VENV_PATH=~/RAG_VENV ./start_backend.sh
+# Terminal 1 (project root, venv active)
+uvicorn backend.main:app --port 8000 --reload
 
 # Terminal 2
-./start_frontend.sh
+cd frontend && npm run dev
 ```
+
+---
+
+## Rate limits (long PDFs on free-tier APIs)
+
+Ingestion makes **one LLM call per chunk**, so a 100-page PDF is ~200 calls of
+~2,000 tokens each. Free tiers limit tokens per *minute* and per *day*.
+
+What the code does for you:
+
+| Mechanism | Where | Effect |
+|---|---|---|
+| Client-side throttle | `llm/rate_limiter.py` | Paces calls to stay under requests/min and tokens/min, so 429s are rare |
+| Retry-after on 429 | `llm/client.py` | Waits exactly as long as the server asks, then retries |
+| Daily-quota detection | `llm/client.py` | Stops cleanly (HTTP 429 / exit code 2) instead of hanging for hours |
+| Per-chunk cache | `.cache/extractions/` | Re-uploading the same PDF later **resumes** — finished chunks cost nothing |
+| All-or-nothing writes | `/ingest`, `run_stage1.py` | Nothing reaches Neo4j/Qdrant until every chunk is extracted |
+
+What you can tune in `.env`:
+
+```env
+GROQ_MODEL=openai/gpt-oss-120b   # default; see "Choosing a Groq model" below
+GROQ_TPM=8000             # tokens/min  (default 6000 — check console.groq.com/settings/limits)
+GROQ_RPM=30               # requests/min
+
+# Optionally use a different model just for bulk extraction
+# (answers still use GROQ_MODEL)
+# EXTRACTION_MODEL=openai/gpt-oss-20b
+
+EXTRACTION_MAX_TOKENS=2048   # output budget per chunk (counts toward TPM)
+LLM_MAX_WAIT_SECONDS=120     # longest 429 wait before giving up
+```
+
+The same `<PROVIDER>_RPM`, `<PROVIDER>_TPM` and `<PROVIDER>_MODEL` variables work
+for `GEMINI`, `OPENAI` and `OLLAMA`.
+
+### Choosing a Groq model
+
+Benchmarked on this project's extraction prompt (free tier, Oct 2026):
+
+| Model | Verdict |
+|---|---|
+| `openai/gpt-oss-120b` | **Default.** Most precise relations, fewest output tokens per chunk (more chunks/min) |
+| `openai/gpt-oss-20b` | Slightly faster and finds more relations, but mislabels some (e.g. `TARGETS` vs `ACTIVATES`) |
+| `qwen/qwen3.8-27b` | Accurate, but capped at 1,000 *output* tokens/min — far too slow for ingestion |
+
+gpt-oss and qwen3 are reasoning models; `llm/client.py` keeps their hidden
+"thinking" minimal (`LLM_REASONING_EFFORT`), because at `medium` the thinking
+consumed the whole output budget and broke the JSON.
+
+**Unlimited option:** install [Ollama](https://ollama.com), run `ollama pull llama3.1:8b`,
+and set `LLM_PROVIDER=ollama`. It's slower per call but never rate-limited.
 
 ---
 
@@ -117,3 +165,5 @@ VENV_PATH=~/RAG_VENV ./start_backend.sh
 | `Connection refused :6333` | Start Qdrant: `docker run -p 6333:6333 qdrant/qdrant` |
 | Graph Explorer shows nothing | Upload a PDF first, then refresh |
 | `CORS error` in browser | Use the Vite dev proxy — access frontend at `:5173`, not `:8000` directly |
+| `Rate limit error (429)` on large PDFs | Daily quota used up — retry later (progress is cached), enable **Large PDF mode**, or see **Rate limits** above |
+| `LLM provider error (401)` | The API key in `.env` is invalid or revoked — create a new one |

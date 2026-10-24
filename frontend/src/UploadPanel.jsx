@@ -220,6 +220,7 @@ export function UploadPanel({ onSuccess, onDocumentsChange }) {
   const [result, setResult]       = useState(null)
   const [error, setError]         = useState(null)
   const [linkIds, setLinkIds]     = useState(false)
+  const [largePdf, setLargePdf]   = useState(false)
   const [validFrom, setValidFrom] = useState('')
   const [validUntil, setValidUntil] = useState('')
   const [refreshTrigger, setRefreshTrigger] = useState(0)
@@ -239,12 +240,22 @@ export function UploadPanel({ onSuccess, onDocumentsChange }) {
     setResult(null)
     const form = new FormData()
     form.append('file', file)
-    const params = new URLSearchParams({ provider: 'auto', link_ids: linkIds })
+    const params = new URLSearchParams({
+      provider: 'auto',
+      link_ids: linkIds,
+      // Bigger chunks = half as many LLM calls, which matters on free-tier rate limits
+      chunk_tokens: largePdf ? 1024 : 512,
+    })
     if (validFrom)  params.append('valid_from',  validFrom)
     if (validUntil) params.append('valid_until', validUntil)
     try {
       const res = await fetch(`${API}/ingest?${params}`, { method: 'POST', body: form })
       const data = await res.json()
+      if (!res.ok) {
+        // e.g. 429 = LLM rate limit used up (progress is cached — retry later)
+        setError(data.detail || `Ingestion failed (HTTP ${res.status})`)
+        return
+      }
       setResult(data)
       if (data.status === 'ok' || data.status === 'already_ingested') {
         onSuccess?.(data)
@@ -284,6 +295,10 @@ export function UploadPanel({ onSuccess, onDocumentsChange }) {
           <label className="toggle-row">
             <input type="checkbox" checked={linkIds} onChange={e => setLinkIds(e.target.checked)} />
             Link UMLS/MeSH/RxNorm IDs (Phase 2)
+          </label>
+          <label className="toggle-row" title="Uses 1024-token chunks: half the LLM calls, so long PDFs hit rate limits far less">
+            <input type="checkbox" checked={largePdf} onChange={e => setLargePdf(e.target.checked)} />
+            Large PDF mode (fewer LLM calls)
           </label>
           <label className="toggle-row">
             Valid from:

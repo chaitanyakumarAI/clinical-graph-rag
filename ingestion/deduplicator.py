@@ -18,7 +18,6 @@ from __future__ import annotations
 import re
 import unicodedata
 from typing import List, Dict, Tuple
-from collections import defaultdict
 from rapidfuzz import fuzz, process as rfprocess
 
 from ingestion.entity_extractor import ExtractedEntity, ExtractedRelation, ExtractionResult
@@ -251,7 +250,6 @@ def deduplicate(results: List[ExtractionResult]) -> Tuple[List[Dict], List[Dict]
 
 
 if __name__ == "__main__":
-    from ingestion.entity_extractor import ExtractedEntity, ExtractedRelation, ExtractionResult
 
     r1 = ExtractionResult(
         chunk_id="c1", source="doc1", page=1, paragraph_index=0,

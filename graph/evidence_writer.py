@@ -22,7 +22,6 @@ Called from graph/graph_loader.py after upsert_relations_batch().
 
 from __future__ import annotations
 import hashlib
-from collections import defaultdict
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, TYPE_CHECKING
 
@@ -48,6 +47,7 @@ def write_evidence_batch(
     client:             "Neo4jClient",
     extracted_at:       Optional[str] = None,
     batch_size:         int = 100,
+    doc_sha256:         str = "",
 ) -> int:
     """
     Create Evidence nodes and link them to entity edges, chunks, and documents.
@@ -59,6 +59,7 @@ def write_evidence_batch(
         client:             Open Neo4jClient
         extracted_at:       ISO timestamp
         batch_size:         Cypher UNWIND batch size
+        doc_sha256:         Registered Document hash (API uploads); empty for CLI runs
 
     Returns:
         Number of Evidence nodes written
@@ -129,7 +130,7 @@ def write_evidence_batch(
         print("[evidence_writer] No evidence rows to write")
         return 0
 
-    _write_batches(evidence_rows, client, batch_size)
+    _write_batches(evidence_rows, client, batch_size, doc_sha256=doc_sha256)
     print(f"[evidence_writer] ✅ {len(evidence_rows)} Evidence nodes written")
     return len(evidence_rows)
 
@@ -168,7 +169,12 @@ def _best_excerpt(subject: str, obj: str, text: str, max_chars: int = 200) -> st
     return (sentences[0][:max_chars] + "…") if sentences and len(sentences[0]) > max_chars else (sentences[0] if sentences else "")
 
 
-def _write_batches(rows: List[Dict], client: "Neo4jClient", batch_size: int):
+def _write_batches(
+    rows:       List[Dict],
+    client:     "Neo4jClient",
+    batch_size: int,
+    doc_sha256: str = "",
+):
     """Write Evidence nodes and all edges in batches via UNWIND."""
     with client.driver.session() as s:
         for i in range(0, len(rows), batch_size):
@@ -207,11 +213,21 @@ def _write_batches(rows: List[Dict], client: "Neo4jClient", batch_size: int):
                 """, rows=chunk_rows)
 
             # 4. Link Evidence → Document (FROM_DOCUMENT)
-            doc_rows = [r for r in batch if r.get("source")]
-            if doc_rows:
+            if doc_sha256:
+                # Uploaded via the API: chunk "source" is a temp-file name, so
+                # link to the registered Document by its hash instead.
                 s.run("""
+                    MATCH (d:Document {sha256: $sha256})
                     UNWIND $rows AS r
                     MATCH (ev:Evidence {evidence_id: r.evidence_id})
-                    MERGE (d:Document {filename: r.source})
                     MERGE (ev)-[:FROM_DOCUMENT]->(d)
-                """, rows=doc_rows)
+                """, rows=batch, sha256=doc_sha256)
+            else:
+                doc_rows = [r for r in batch if r.get("source")]
+                if doc_rows:
+                    s.run("""
+                        UNWIND $rows AS r
+                        MATCH (ev:Evidence {evidence_id: r.evidence_id})
+                        MERGE (d:Document {filename: r.source})
+                        MERGE (ev)-[:FROM_DOCUMENT]->(d)
+                    """, rows=doc_rows)

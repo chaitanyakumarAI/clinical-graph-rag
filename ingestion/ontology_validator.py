@@ -12,7 +12,7 @@ so callers can log or auto-correct direction errors rather than silently droppin
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, FrozenSet, Optional, Tuple
 
 # ── Canonical entity types ────────────────────────────────────────────────────

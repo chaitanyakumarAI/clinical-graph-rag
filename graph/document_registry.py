@@ -12,7 +12,7 @@ already been ingested (same SHA-256), it returns immediately without re-processi
 from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import Dict, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from graph.neo4j_client import Neo4jClient

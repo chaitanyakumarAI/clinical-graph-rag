@@ -34,7 +34,7 @@ def load_to_graph(
     chunks:              List[Dict],
     entities:            List[Dict],
     relations:           List[Dict],
-    extraction_results:  List,          # List[ExtractionResult]
+    extraction_results:  List["ExtractionResult"],
     client:              "Neo4jClient",
     filename:            str = "",
     sha256:              str = "",       # canonical document identity
@@ -113,6 +113,7 @@ def load_to_graph(
             extraction_results = extraction_results,
             client             = client,
             extracted_at       = ts,
+            doc_sha256         = sha256,
         )
     except Exception as e:
         print(f"[graph_loader] ⚠️ Evidence writing failed (non-fatal): {e}")
@@ -168,7 +169,7 @@ def load_to_neo4j(
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _build_chunk_entity_confidence(
-    extraction_results: List,   # List[ExtractionResult]
+    extraction_results: List["ExtractionResult"],
 ) -> Dict[str, Dict[str, float]]:
     """
     Build a map: {chunk_id → {entity_name → confidence}}

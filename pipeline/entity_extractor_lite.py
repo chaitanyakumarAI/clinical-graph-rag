@@ -12,12 +12,13 @@ this module only extracts entity *names and types* — fast and cheap.
 """
 
 from __future__ import annotations
-import json
 import os
 from typing import List, Dict
-from dotenv import load_dotenv
 
-load_dotenv()
+from llm import RateLimitExhausted, chat_json, resolve_provider
+
+# OpenAI's 4o is overkill for spotting names — use the mini model there.
+_OPENAI_SPOTTER_MODEL = "gpt-4o-mini"
 
 SYSTEM_PROMPT = """You are a fast biomedical entity spotter.
 
@@ -43,36 +44,13 @@ OUTPUT FORMAT:
 }"""
 
 
-def _call_groq(text: str) -> dict:
-    from groq import Groq
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": f"Text:\n\n{text[:4000]}"},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.0,
-        max_tokens=512,
-    )
-    return json.loads(resp.choices[0].message.content)
-
-
-def _call_openai(text: str) -> dict:
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",  # cheaper model — entity spotting doesn't need 4o
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": f"Text:\n\n{text[:4000]}"},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.0,
-        max_tokens=512,
-    )
-    return json.loads(resp.choices[0].message.content)
+def _call_llm(text: str, provider: str) -> dict:
+    provider = resolve_provider(provider)
+    model = None
+    if provider == "openai" and not os.getenv("OPENAI_MODEL"):
+        model = _OPENAI_SPOTTER_MODEL
+    return chat_json(SYSTEM_PROMPT, f"Text:\n\n{text[:4000]}",
+                     provider=provider, model=model, max_tokens=512)
 
 
 def _scispacy_fallback(text: str) -> List[Dict]:
@@ -105,7 +83,7 @@ def spot_entities_in_chunks(
 
     Args:
         chunks:   List of {text, source, page, ...} dicts from vector retrieval
-        provider: "auto" | "groq" | "openai" | "scispacy"
+        provider: "auto" | "gemini" | "groq" | "openai" | "ollama" | "scispacy"
 
     Returns:
         Deduplicated list of entity name strings
@@ -123,16 +101,14 @@ def spot_entities_in_chunks(
         return list({e["name"] for e in raw_entities if e["name"]})
 
     try:
-        if provider == "groq" or (provider == "auto" and os.getenv("GROQ_API_KEY")):
-            data = _call_groq(combined)
-        else:
-            data = _call_openai(combined)
-
+        data = _call_llm(combined, provider)
         entities = data.get("entities", [])
         names = list({e["name"] for e in entities if e.get("name")})
         print(f"[entity_extractor_lite] Found {len(names)} entities in retrieved chunks")
         return names
 
+    except RateLimitExhausted:
+        raise
     except Exception as e:
         print(f"[entity_extractor_lite] LLM failed ({e}), trying scispaCy fallback")
         raw = _scispacy_fallback(combined)

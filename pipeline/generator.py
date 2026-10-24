@@ -4,11 +4,8 @@ Stage 3 — LLM answer generation with inline citations.
 """
 
 from __future__ import annotations
-import os
-from typing import List, Dict
-from dotenv import load_dotenv
 
-load_dotenv()
+from llm import chat
 
 SYSTEM_PROMPT = """You are a precise medical assistant. Answer the question using ONLY the provided context.
 
@@ -30,10 +27,9 @@ Answer (with inline citations):"""
 
 
 def generate_answer(
-    query: str,
+    query:         str,
     fused_context: str,
-    provider: str = "auto",
-    stream: bool = False,
+    provider:      str = "auto",
 ) -> str:
     """
     Generate a grounded answer using the fused context.
@@ -41,45 +37,11 @@ def generate_answer(
     Args:
         query:         Original user query
         fused_context: Output of reranker.fuse_and_rerank()
-        provider:      "auto" | "groq" | "openai"
-        stream:        Whether to stream the response (False for API use)
+        provider:      "auto" | "gemini" | "groq" | "openai" | "ollama"
 
     Returns:
         Answer string with inline citations
     """
     prompt = USER_TEMPLATE.format(context=fused_context, query=query)
-
-    if provider == "groq" or (provider == "auto" and os.getenv("GROQ_API_KEY")):
-        return _groq_generate(prompt)
-    else:
-        return _openai_generate(prompt)
-
-
-def _groq_generate(prompt: str) -> str:
-    from groq import Groq
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ],
-        temperature=0.1,
-        max_tokens=1024,
-    )
-    return resp.choices[0].message.content
-
-
-def _openai_generate(prompt: str) -> str:
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ],
-        temperature=0.1,
-        max_tokens=1024,
-    )
-    return resp.choices[0].message.content
+    return chat(SYSTEM_PROMPT, prompt, provider=provider,
+                max_tokens=1024, temperature=0.1)

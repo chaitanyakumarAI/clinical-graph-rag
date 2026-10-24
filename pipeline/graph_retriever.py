@@ -24,7 +24,7 @@ Public API (backward-compatible):
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional, TYPE_CHECKING
+from typing import List, Dict, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from graph.neo4j_client import Neo4jClient
