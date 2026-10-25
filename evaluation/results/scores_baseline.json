@@ -1,0 +1,80 @@
+{
+  "Q1": {
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.9999999999999999,
+    "context_recall": 1.0,
+    "answer_correctness": 0.8781308117879023
+  },
+  "Q2": {
+    "faithfulness": 0.75,
+    "answer_relevancy": 0.8890820985546473,
+    "context_recall": 1.0,
+    "answer_correctness": 0.537160147333531
+  },
+  "Q3": {
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.8584326350563102,
+    "context_recall": 1.0,
+    "answer_correctness": 0.7262287175801154
+  },
+  "Q4": {
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.8365607084998803,
+    "context_recall": 0.6666666666666666,
+    "answer_correctness": 0.7959824580211599
+  },
+  "Q5": {
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.7956779680513748,
+    "context_recall": 1.0,
+    "answer_correctness": 0.9729841662735959
+  },
+  "Q6": {
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.8717820950883868,
+    "context_recall": 1.0,
+    "answer_correctness": 0.9763043847975565
+  },
+  "Q7": {
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.8989397565049345,
+    "context_recall": 1.0,
+    "answer_correctness": 0.6556194591655481
+  },
+  "Q8": {
+    "faithfulness": 0.75,
+    "answer_relevancy": 0.6932092984385391,
+    "context_recall": 1.0,
+    "answer_correctness": 0.6303314998408396
+  },
+  "Q9": {
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.8273762916894942,
+    "context_recall": 1.0,
+    "answer_correctness": 0.8862575643391642
+  },
+  "Q10": {
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.8346344008773106,
+    "context_recall": 1.0,
+    "answer_correctness": 0.7566318621952262
+  },
+  "Q11": {
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.7539223401301267,
+    "context_recall": 1.0,
+    "answer_correctness": 0.6008925625010353
+  },
+  "Q12": {
+    "faithfulness": 0.75,
+    "answer_relevancy": 0.94989788123458,
+    "context_recall": 1.0,
+    "answer_correctness": 0.7176919958042873
+  },
+  "Q13": {
+    "faithfulness": 1.0,
+    "answer_relevancy": 0.0,
+    "context_recall": 0.0,
+    "answer_correctness": 0.7600870490124823
+  }
+}

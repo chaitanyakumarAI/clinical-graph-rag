@@ -1,0 +1,80 @@
+<p><b>Verdict:</b> query rewriting does what it was built for: it repairs retrieval for messy,
+abbreviated questions. It is neutral on questions that are already well written. Across the 12
+answerable questions, context recall rose from 0.97 to <b>1.00</b> and answer correctness was flat
+(0.76 → 0.75). On the 5 messy questions, recall rose from 0.93 to <b>1.00</b> and correctness from
+0.79 to <b>0.84</b>. These differences are small compared with the judge noise measured below, so
+treat them as directional rather than proven.</p>
+
+<h3>1. Rewriting fixes retrieval for messy questions</h3>
+<ul>
+<li><b>Q4 "side efects of metformn?"</b> was rewritten to <i>"What are the side effects of
+metformin?"</i>. Context recall went from 0.67 to <b>1.00</b>: the typo-free query found the
+metformin passage the literal query missed.</li>
+<li><b>Q10 "T2DM pt w/ albuminuria needs a BP drug…"</b> was expanded and split into 2 sub-queries.
+The extra search brought in the diabetes guide, and correctness went from 0.76 to <b>0.87</b>.</li>
+<li><b>Q2 "why is high BP called silent"</b>: correctness went from 0.54 to <b>0.70</b>.</li>
+</ul>
+
+<h3>2. No benefit on clean questions, and some measured noise</h3>
+<p>For 6 of the 7 clean questions the rewriter returned the question essentially unchanged
+(it only split Q8), so retrieval was identical. <b>Q12 calibrates the noise:</b> its rewritten query
+was word-for-word the original, retrieval returned the same documents, and both answers say the same
+thing, yet answer correctness was judged 0.72 in one run and 0.46 in the other. Differences of
+roughly ±0.25 on a single question are therefore judge and generation variance, not an effect of
+rewriting.</p>
+
+<h3>3. Retrieval is not the bottleneck; answer synthesis is</h3>
+<p>Context recall is close to 1.0 and faithfulness is 0.92–0.94 in both configurations, but answer
+correctness stays around 0.75. The missing points come from the answer step:</p>
+<ul>
+<li><b>Answers are too brief.</b> Q11 correctly names amiodarone and CYP2C9 but omits the
+"reduce the warfarin dose by 30–50%" advice, although that sentence <i>was</i> in the retrieved
+context. The generator prompt's "be concise" rule costs completeness.</li>
+<li><b>Cross-document reasoning is the weakest area</b> (multi-hop correctness about 0.65–0.72). Q8,
+<i>"Which diabetes drugs interact with blood-pressure medications?"</i>, misses the
+insulin/glipizide + metoprolol interaction in <b>both</b> configurations. Answering it requires
+knowing that insulin is a diabetes drug (diabetes guide) and metoprolol a blood-pressure drug
+(hypertension guide). In the rewrite run the model also asserted that no other diabetes drug
+interacts, which is wrong.</li>
+<li><b>Over-generalisation lowers faithfulness.</b> In Q12 both runs claimed that lisinopril +
+hydrochlorothiazide alone can cause acute kidney injury. The documents only state this when an NSAID
+is added (the "triple whammy").</li>
+</ul>
+
+<h3>4. Grounded refusal works</h3>
+<p>Q13 (atorvastatin dose, not in the documents) was correctly answered <i>"Insufficient information
+in the provided sources"</i> in both runs. RAGAS scores any refusal 0 for relevancy and recall by
+design, so Q13 is excluded from the averages.</p>
+
+<h3>5. Cost of rewriting</h3>
+<p>One extra LLM call per question (about 1 second of model time on Groq). Median end-to-end latency
+rose from 60 s to 78 s. Almost all of that is the client-side rate limiter waiting, because the extra
+call spends part of the free tier's 8,000 tokens/minute budget. On a paid tier the overhead would be
+about a second.</p>
+
+<h3>6. Issues found and fixed during the evaluation</h3>
+<ul>
+<li><b>The reranker crashed on every query</b> (FlagEmbedding is incompatible with transformers 5),
+so every candidate received the same fallback score and graph paths always outranked document text.
+Before the fix, a test query had <b>0 of 8</b> context slots filled with document chunks. It now runs
+through sentence-transformers' CrossEncoder.</li>
+<li><b>Leftover data from earlier uploads</b> (<i>sample.pdf</i>, <i>sample2.pdf</i> and an orphaned
+source <i>tmp880ca9_x</i> with no registered document) appears in most results and dilutes the
+context.</li>
+</ul>
+
+<h3>Recommendations (in order of expected impact)</h3>
+<ol>
+<li><b>Improve the answer prompt:</b> ask for every clinically relevant fact in the context that
+answers the question (mechanism, consequence, management), and forbid generalising beyond what a
+passage states.</li>
+<li><b>Strengthen cross-document graph retrieval:</b> for "which <i>X</i> drugs interact with
+<i>Y</i> drugs" questions, traverse
+(drug)-[:TREATS]-&gt;(disease) together with (drug)-[:INTERACTS_WITH]-(other drug), so drug-class
+membership from one PDF links to interactions from another.</li>
+<li><b>Keep rewriting on.</b> It is cheap and protects against messy input. To save the extra call,
+it could be merged into the query-planner call, which already reads the question.</li>
+<li><b>Clean the database</b> of legacy and orphaned chunks, then re-run this evaluation.</li>
+<li><b>Evaluate at a larger scale:</b> 30 or more questions and 3 repeated runs, averaging scores, to
+get below the ±0.25 per-question noise.</li>
+</ol>

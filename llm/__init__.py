@@ -7,6 +7,7 @@ from llm.client import (
     model_for,
     parse_json_reply,
     resolve_provider,
+    usage_summary,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "model_for",
     "parse_json_reply",
     "resolve_provider",
+    "usage_summary",
 ]

@@ -90,6 +90,7 @@ export function QueryPanel({ onQueryResult }) {
   const [error, setError]           = useState(null)
   const [useLLMCypher, setLLMCypher] = useState(false)
   const [useGDS, setUseGDS]         = useState(false)
+  const [useRewrite, setUseRewrite] = useState(true)
 
   const handleQuery = async () => {
     if (!question.trim()) return
@@ -104,6 +105,7 @@ export function QueryPanel({ onQueryResult }) {
           question,
           provider: 'auto',
           top_k: 5, top_n: 8,
+          use_query_rewrite: useRewrite,
           use_llm_cypher: useLLMCypher,
           use_gds: useGDS,
         }),
@@ -148,6 +150,10 @@ export function QueryPanel({ onQueryResult }) {
       </div>
 
       <div className="query-options">
+        <label className="toggle-row" title="Fix typos, expand abbreviations and split multi-part questions before searching">
+          <input type="checkbox" checked={useRewrite} onChange={e => setUseRewrite(e.target.checked)} />
+          Query rewriting
+        </label>
         <label className="toggle-row">
           <input type="checkbox" checked={useLLMCypher} onChange={e => setLLMCypher(e.target.checked)} />
           Dynamic Cypher (Phase 3)
@@ -193,6 +199,18 @@ export function QueryPanel({ onQueryResult }) {
             </span>
             <span className="badge">{result.latency_ms}ms</span>
           </div>
+
+          {/* What retrieval searched for, when it differs from the typed question */}
+          {(result.rewritten_query !== result.question || result.sub_queries?.length > 0) && (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              🔁 Searched as: <em>{result.rewritten_query}</em>
+              {result.sub_queries?.length > 0 && (
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+                  {result.sub_queries.map(q => <span key={q} className="chip">{q}</span>)}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Answer */}
           <div>

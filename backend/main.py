@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from graph.neo4j_client         import Neo4jClient, NODE_LABELS
 from llm                        import RateLimitExhausted
 from pipeline.query_planner     import plan_query
+from pipeline.query_rewriter    import rewrite_query, no_rewrite
 from pipeline.entity_linker     import link_entities, invalidate_cache as invalidate_entity_cache
 from pipeline.graph_retriever   import retrieve_subgraph, format_subgraph_for_context
 from pipeline.vector_retriever  import retrieve_vector_context
@@ -115,6 +116,7 @@ class QueryRequest(BaseModel):
     provider:        str   = "auto"
     top_k:           int   = 5
     top_n:           int   = 8
+    use_query_rewrite: bool = True    # rewrite + split the question before retrieval
     use_llm_cypher:  bool  = False    # Phase 3: LLM-generated Cypher
     # GDS is now AUTO-ACTIVATED from route — no toggle needed;
     # set force_no_gds=True to disable for latency-sensitive requests
@@ -124,6 +126,8 @@ class QueryRequest(BaseModel):
 
 class QueryResponse(BaseModel):
     question:            str
+    rewritten_query:     str              # what retrieval actually searched for
+    sub_queries:         List[str]        # extra searches for multi-part questions
     answer:              str
     route:               str
     route_reason:        str
@@ -139,6 +143,7 @@ class QueryResponse(BaseModel):
     generated_cypher:    List[str]
     provenance:          List[Dict]
     subgraph:            Optional[Dict]   # structured node+edge subgraph
+    retrieved_contexts:  List[str]        # exact context pieces given to the answer LLM
     latency_ms:          float
 
 
@@ -164,8 +169,17 @@ def query(req: QueryRequest):
     t0    = time.time()
     neo4j = get_neo4j()
 
-    # ── Step 1: Qdrant-first semantic retrieval ───────────────────────────────
-    vector_results = retrieve_vector_context(req.question, top_k=req.top_k)
+    # ── Step 0: Rewrite the question for retrieval ────────────────────────────
+    # Retrieval and planning use the rewritten question; the final answer
+    # still responds to the user's original wording.
+    rewrite = (rewrite_query(req.question, provider=req.provider)
+               if req.use_query_rewrite else no_rewrite(req.question))
+    search_question = rewrite.rewritten
+
+    # ── Step 1: Qdrant-first semantic retrieval (one search per sub-query) ────
+    vector_results = _merge_round_robin([
+        retrieve_vector_context(q, top_k=req.top_k) for q in rewrite.search_queries
+    ])
 
     # ── Map internal IDs to filenames ────────────────────────────────────────
     from graph.document_registry import get_source_map
@@ -196,7 +210,7 @@ def query(req: QueryRequest):
     # ── Step 3: Adaptive query planning ──────────────────────────────────────
     chunk_texts = [r["text"] for r in vector_results]
     plan = plan_query(
-        req.question,
+        search_question,
         provider=req.provider,
         context_chunks=chunk_texts,
     )
@@ -223,7 +237,7 @@ def query(req: QueryRequest):
                 max_nodes        = 30,
                 max_edges        = 60,
                 use_llm_cypher   = req.use_llm_cypher,
-                question         = req.question,
+                question         = search_question,
                 provider         = req.provider,
                 target_relations = plan.target_relations,   # intent flows into Neo4j
                 target_labels    = plan.target_labels,      # intent flows into Neo4j
@@ -289,7 +303,7 @@ def query(req: QueryRequest):
 
     # ── Step 7: Rerank + fuse all three sources ───────────────────────────────
     ranked_items, fused_context = fuse_and_rerank(
-        query          = req.question,
+        query          = search_question,
         graph_results  = graph_results,
         vector_results = vector_results,
         gds_results    = gds_results,
@@ -298,10 +312,12 @@ def query(req: QueryRequest):
 
     # ── Step 8: Generate answer ───────────────────────────────────────────────
     # Use structured subgraph context when available, else fall back to path list
+    retrieved_contexts = [f"{item['meta']}\n{item['text']}" for item in ranked_items]
     if retrieved_subgraph and not retrieved_subgraph.is_empty():
         subgraph_context = format_subgraph_for_context(retrieved_subgraph)
         # Prepend the structured subgraph block to the fused context
         fused_context = subgraph_context + "\n\n" + fused_context if fused_context else subgraph_context
+        retrieved_contexts.insert(0, subgraph_context)
     answer  = generate_answer(req.question, fused_context, provider=req.provider)
     latency = (time.time() - t0) * 1000
 
@@ -343,6 +359,8 @@ def query(req: QueryRequest):
 
     return QueryResponse(
         question            = req.question,
+        rewritten_query     = rewrite.rewritten,
+        sub_queries         = rewrite.sub_queries,
         answer              = answer,
         route               = plan.route,
         route_reason        = plan.reason,
@@ -378,12 +396,31 @@ def query(req: QueryRequest):
             "evidence_chunks": retrieved_subgraph.evidence_chunks if retrieved_subgraph else [],
             "intent_aware":    retrieved_subgraph.intent_aware if retrieved_subgraph else False,
         },
+        retrieved_contexts  = retrieved_contexts,
         latency_ms          = round(latency, 1),
     )
 
 
 # Plain `def` (not `async def`): ingestion blocks for minutes, so FastAPI must
 # run it in a worker thread or every other request would freeze meanwhile.
+def _merge_round_robin(result_lists: List[List[Dict]]) -> List[Dict]:
+    """
+    Merge vector results from several sub-queries, taking the best hit of each
+    sub-query first, then the second-best of each, and so on (duplicates dropped).
+
+    Interleaving matters because later steps only look at the first few chunks:
+    sorting by raw score could let one sub-query fill all of those slots.
+    """
+    merged: List[Dict] = []
+    seen_ids = set()
+    for rank in range(max((len(results) for results in result_lists), default=0)):
+        for results in result_lists:
+            if rank < len(results) and results[rank]["chunk_id"] not in seen_ids:
+                seen_ids.add(results[rank]["chunk_id"])
+                merged.append(results[rank])
+    return merged
+
+
 @app.post("/ingest")
 def ingest(
     file:         UploadFile = File(...),

@@ -1,0 +1,28 @@
+{
+  "answer": {
+    "openai/gpt-oss-120b": {
+      "calls": 91,
+      "tokens": 154934
+    }
+  },
+  "judge": {
+    "openai/gpt-oss-20b": {
+      "calls": 12,
+      "tokens": 22938
+    },
+    "qwen/qwen3.8-27b": {
+      "calls": 24,
+      "tokens": 45528
+    }
+  },
+  "judge, first pass (estimated, not logged)": {
+    "openai/gpt-oss-20b": {
+      "calls": 66,
+      "tokens": 126159
+    },
+    "qwen/qwen3.8-27b": {
+      "calls": 94,
+      "tokens": 180812
+    }
+  }
+}

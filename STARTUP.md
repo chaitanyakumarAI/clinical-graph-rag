@@ -92,6 +92,27 @@ Frontend opens at: **http://localhost:5173**
 
 ---
 
+## Query rewriting
+
+Before retrieval, `pipeline/query_rewriter.py` asks the LLM to clean up the question
+(fix typos, expand abbreviations like *T2DM* or *BP*) and to split multi-part questions
+into sub-queries, each searched separately. The answer still responds to the original
+wording. It is on by default; turn it off with the **Query rewriting** checkbox or
+`"use_query_rewrite": false` in the `/query` body. The response shows what was searched
+(`rewritten_query`, `sub_queries`).
+
+## Evaluation (RAGAS)
+
+```bash
+python evaluation/run_ragas.py      # answers testset.json with and without rewriting, then scores them
+python evaluation/make_report.py    # builds evaluation/RAGAS_Evaluation_Report.pdf
+```
+
+Both steps cache per question in `evaluation/results/`, so a run stopped by the daily
+quota resumes where it left off. Judge models are set in `METRIC_JUDGES`.
+
+---
+
 ## Quick Start (both servers in parallel)
 
 ```bash

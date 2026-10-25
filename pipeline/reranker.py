@@ -16,21 +16,25 @@ _reranker = None
 
 
 def _get_reranker():
+    # Loaded through sentence-transformers' CrossEncoder: FlagEmbedding's
+    # FlagReranker breaks with transformers 5 ("no attribute prepare_for_model").
     global _reranker
     if _reranker is None:
-        from FlagEmbedding import FlagReranker
+        from sentence_transformers import CrossEncoder
         print(f"[reranker] Loading model: {RERANKER_MODEL} …")
-        _reranker = FlagReranker(RERANKER_MODEL, use_fp16=True)
+        _reranker = CrossEncoder(RERANKER_MODEL)
     return _reranker
 
 
 def _score_candidates(query: str, candidates: List[str]) -> List[float]:
-    """Score each candidate text against the query using the cross-encoder."""
+    """Score each candidate text against the query (0–1) using the cross-encoder."""
     try:
+        import torch
         reranker = _get_reranker()
-        pairs    = [[query, c] for c in candidates]
-        scores   = reranker.compute_score(pairs, normalize=True)
-        return scores if isinstance(scores, list) else [scores]
+        pairs    = [(query, c) for c in candidates]
+        scores   = reranker.predict(pairs, activation_fn=torch.nn.Sigmoid(),
+                                    show_progress_bar=False)
+        return [float(score) for score in scores]
     except Exception as e:
         print(f"[reranker] ⚠️  Reranker unavailable ({e}), using original scores")
         return [0.5] * len(candidates)

@@ -1,0 +1,67 @@
+[
+  {
+    "id": "Q1", "category": "definition", "style": "clean",
+    "question": "How does empagliflozin lower blood glucose?",
+    "reference": "Empagliflozin inhibits the SGLT2 protein in the proximal tubule of the kidney, which reduces reabsorption of filtered glucose and increases urinary glucose excretion."
+  },
+  {
+    "id": "Q2", "category": "definition", "style": "messy",
+    "question": "why is high BP called silent",
+    "reference": "Hypertension is called a silent disease because it is usually asymptomatic."
+  },
+  {
+    "id": "Q3", "category": "definition", "style": "clean",
+    "question": "How is hypoglycemia treated?",
+    "reference": "Mild hypoglycemia is treated with 15 grams of fast-acting carbohydrate, rechecking glucose after 15 minutes. Severe hypoglycemia is treated with glucagon."
+  },
+  {
+    "id": "Q4", "category": "single-hop", "style": "messy",
+    "question": "side efects of metformn?",
+    "reference": "Metformin commonly causes gastrointestinal effects: nausea, diarrhea, abdominal discomfort and a metallic taste. Long-term use can cause vitamin B12 deficiency. Lactic acidosis is rare but serious."
+  },
+  {
+    "id": "Q5", "category": "single-hop", "style": "messy",
+    "question": "AF symptoms",
+    "reference": "Atrial fibrillation causes palpitations, shortness of breath, fatigue and dizziness."
+  },
+  {
+    "id": "Q6", "category": "single-hop", "style": "clean",
+    "question": "When is semaglutide contraindicated?",
+    "reference": "Semaglutide is contraindicated in patients with a personal or family history of medullary thyroid carcinoma or multiple endocrine neoplasia type 2 (MEN2)."
+  },
+  {
+    "id": "Q7", "category": "single-hop", "style": "clean",
+    "question": "Why does lisinopril cause a cough?",
+    "reference": "Lisinopril causes a dry, persistent cough because ACE inhibition leads to accumulation of bradykinin."
+  },
+  {
+    "id": "Q8", "category": "multi-hop", "style": "clean",
+    "question": "Which diabetes drugs interact with blood-pressure medications?",
+    "reference": "Empagliflozin interacts with hydrochlorothiazide and other diuretics, increasing the risk of volume depletion and hypotension. Insulin and glipizide interact with metoprolol, which masks the warning symptoms of hypoglycemia such as tachycardia and tremor."
+  },
+  {
+    "id": "Q9", "category": "multi-hop", "style": "messy",
+    "question": "pt on insulin + metoprolol, why check sugar more often?",
+    "reference": "Insulin can cause hypoglycemia, and metoprolol masks the warning symptoms of hypoglycemia such as tachycardia and tremor (sweating is not masked), so the patient may not recognize low blood glucose and should monitor glucose more often."
+  },
+  {
+    "id": "Q10", "category": "multi-hop", "style": "messy",
+    "question": "T2DM pt w/ albuminuria needs a BP drug - whats preferred and what interaction to watch",
+    "reference": "An ACE inhibitor such as lisinopril or an ARB such as losartan is preferred because it slows diabetic nephropathy. Watch for hyperkalemia when combined with spironolactone or potassium supplements, and lisinopril should not be combined with losartan."
+  },
+  {
+    "id": "Q11", "category": "multi-hop", "style": "clean",
+    "question": "Which drug raises warfarin levels by inhibiting the enzyme that metabolizes it?",
+    "reference": "Amiodarone inhibits CYP2C9, the enzyme that metabolizes warfarin, which raises the INR and causes bleeding; the warfarin dose is usually reduced by 30 to 50 percent."
+  },
+  {
+    "id": "Q12", "category": "multi-hop", "style": "clean",
+    "question": "What can cause acute kidney injury in a patient taking lisinopril and hydrochlorothiazide?",
+    "reference": "Adding an NSAID such as ibuprofen to an ACE inhibitor and a diuretic (the triple whammy) can cause acute kidney injury."
+  },
+  {
+    "id": "Q13", "category": "not-in-documents", "style": "clean",
+    "question": "What is the dose of atorvastatin for high cholesterol?",
+    "reference": "The provided documents do not contain information about atorvastatin or its dose."
+  }
+]

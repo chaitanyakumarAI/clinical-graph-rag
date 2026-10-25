@@ -34,7 +34,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, Optional
@@ -107,6 +109,17 @@ REASONING_HEADROOM_TOKENS = 1024
 RATE_LIMIT_RETRIES = 6
 TRANSIENT_RETRIES  = 3
 CHARS_PER_TOKEN    = 4   # rough estimate; real usage is recorded after each call
+
+
+# Tokens and calls per model since the process started (see usage_summary()).
+_usage: Dict[str, Dict[str, int]] = defaultdict(lambda: {"calls": 0, "tokens": 0})
+_usage_lock = threading.Lock()
+
+
+def usage_summary() -> Dict[str, Dict[str, int]]:
+    """{model: {"calls": N, "tokens": M}} for every LLM call made so far."""
+    with _usage_lock:
+        return {model: dict(counts) for model, counts in _usage.items()}
 
 
 class RateLimitExhausted(RuntimeError):
@@ -270,6 +283,9 @@ def chat(
 
         if response.usage:
             limiter.record_usage(reservation, response.usage.total_tokens)
+            with _usage_lock:
+                _usage[model]["calls"]  += 1
+                _usage[model]["tokens"] += response.usage.total_tokens
         return response.choices[0].message.content or ""
 
 

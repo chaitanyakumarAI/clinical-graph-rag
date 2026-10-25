@@ -8,3 +8,6 @@ __pycache__/
 
 # Per-chunk LLM extraction cache (lets long-PDF runs resume)
 .cache/
+
+# Evaluation run logs
+evaluation/*.log
