@@ -17,3 +17,4 @@ evaluation/*.log
 venv/
 .pytest_cache/
 .ruff_cache/
+!.env.example
