@@ -11,3 +11,9 @@ __pycache__/
 
 # Evaluation run logs
 evaluation/*.log
+
+# Local virtualenv and tool caches
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
