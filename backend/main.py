@@ -47,6 +47,7 @@ from pipeline.graph_retriever   import retrieve_subgraph, format_subgraph_for_co
 from pipeline.vector_retriever  import retrieve_vector_context
 from pipeline.reranker          import fuse_and_rerank
 from pipeline.generator         import generate_answer
+from pipeline.completeness      import MAX_REPAIR_PARTS, check_coverage, should_check
 from vector.qdrant_client       import VectorStoreUnavailable
 
 app = FastAPI(
@@ -144,6 +145,7 @@ class QueryRequest(BaseModel):
     top_k:           int   = 5
     top_n:           int   = 8
     use_query_rewrite: bool = True    # rewrite + split the question before retrieval
+    use_completeness_check: bool = True  # check every part is answered; repair once if not
     use_llm_cypher:  bool  = False    # Phase 3: LLM-generated Cypher
     # GDS is now AUTO-ACTIVATED from route — no toggle needed;
     # set force_no_gds=True to disable for latency-sensitive requests
@@ -171,6 +173,7 @@ class QueryResponse(BaseModel):
     provenance:          List[Dict]
     subgraph:            Optional[Dict]   # structured node+edge subgraph
     retrieved_contexts:  List[str]        # exact context pieces given to the answer LLM
+    completeness:        Optional[Dict] = None  # parts found, parts missing, whether repaired
     latency_ms:          float
 
 
@@ -346,6 +349,14 @@ def query(req: QueryRequest):
         fused_context = subgraph_context + "\n\n" + fused_context if fused_context else subgraph_context
         retrieved_contexts.insert(0, subgraph_context)
     answer  = generate_answer(req.question, fused_context, provider=req.provider)
+
+    # ── Step 9: Completeness check + one targeted repair ─────────────────────
+    completeness = None
+    if req.use_completeness_check and should_check(plan.route, rewrite.sub_queries):
+        answer, fused_context, completeness = _repair_incomplete_answer(
+            req, rewrite.sub_queries, answer, fused_context,
+            ranked_items, retrieved_contexts, source_map,
+        )
     latency = (time.time() - t0) * 1000
 
     # Build provenance list
@@ -424,8 +435,61 @@ def query(req: QueryRequest):
             "intent_aware":    retrieved_subgraph.intent_aware if retrieved_subgraph else False,
         },
         retrieved_contexts  = retrieved_contexts,
+        completeness        = completeness,
         latency_ms          = round(latency, 1),
     )
+
+
+def _repair_incomplete_answer(
+    req:                QueryRequest,
+    sub_queries:        List[str],
+    answer:             str,
+    fused_context:      str,
+    ranked_items:       List[Dict],
+    retrieved_contexts: List[str],
+    source_map:         Dict[str, str],
+):
+    """
+    Check the draft answer covers every part of the question; if a part is
+    missing, search for that part specifically and regenerate once.
+
+    Mutates ranked_items / retrieved_contexts in place so provenance and the
+    reported contexts include whatever was added. Returns
+    (answer, fused_context, completeness_info).
+    """
+    report = check_coverage(req.question, answer, sub_queries, provider=req.provider)
+    info = {"parts": report.part_names, "missing": report.missing,
+            "repaired": False, "added_sources": []}
+    if not report.missing:
+        return answer, fused_context, info
+
+    seen  = {item["text"][:100] for item in ranked_items}
+    extra: List[Dict] = []
+    for part in report.missing[:MAX_REPAIR_PARTS]:
+        hits = retrieve_vector_context(part, top_k=req.top_k)
+        for hit in hits:
+            hit["source"] = source_map.get(hit.get("source", ""), hit.get("source", ""))
+        hits = [h for h in hits if h["text"][:100] not in seen]
+        if not hits:
+            continue
+        best, _ = fuse_and_rerank(query=part, graph_results=[], vector_results=hits, top_n=2)
+        for item in best:
+            seen.add(item["text"][:100])
+            extra.append(item)
+
+    if extra:
+        added = [f"{item['meta']}\n{item['text']}" for item in extra]
+        fused_context = "\n\n".join([fused_context, *added]) if fused_context else "\n\n".join(added)
+        retrieved_contexts.extend(added)
+        ranked_items.extend(extra)
+
+    # Regenerate even when nothing new was found: most misses are parts whose
+    # facts were already in the context but were dropped from the answer.
+    answer = generate_answer(req.question, fused_context, provider=req.provider,
+                             required_parts=report.part_names)
+    info["repaired"] = True
+    info["added_sources"] = list(dict.fromkeys(f"{i['source']} p.{i['page']}" for i in extra))
+    return answer, fused_context, info
 
 
 # Plain `def` (not `async def`): ingestion blocks for minutes, so FastAPI must

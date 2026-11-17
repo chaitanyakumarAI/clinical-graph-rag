@@ -5,7 +5,8 @@ from fastapi.testclient import TestClient
 
 import backend.main as main
 from llm import RateLimitExhausted
-from pipeline.graph_retriever import _rows_to_subgraph
+from pipeline.completeness import CoverageReport
+from pipeline.graph_retriever import RetrievedSubgraph, _rows_to_subgraph
 from pipeline.query_planner import QueryPlan
 from pipeline.query_rewriter import RewrittenQuery
 
@@ -45,9 +46,11 @@ def app(monkeypatch):
         ]),
         "plan": Recorder(QueryPlan(route="vector_only", reason="definition")),
         "link": Recorder([{"query_term": "metformin", "neo4j_name": "Metformin", "label": "Drug"}]),
-        "subgraph": Recorder((None, [])),
+        "subgraph": Recorder((RetrievedSubgraph(), [])),   # what the real one returns when empty
         "answer": Recorder("Metformin can cause lactic acidosis [diabetes.pdf, p.2]."),
+        "coverage": Recorder(CoverageReport()),          # nothing missing by default
     }
+    monkeypatch.setattr(main, "check_coverage", fakes["coverage"])
     monkeypatch.setattr(main, "get_neo4j", lambda: object())
     monkeypatch.setattr(main, "rewrite_query", fakes["rewrite"])
     monkeypatch.setattr(main, "retrieve_vector_context", fakes["vector"])
@@ -196,6 +199,76 @@ def test_qdrant_transport_error_is_wrapped():
 
     with pytest.raises(store_module.VectorStoreUnavailable, match="Cannot reach Qdrant"):
         store.search([0.0] * 3)
+
+
+# ── Completeness check (step 9) ───────────────────────────────────────────────
+
+def _multi_part(fakes):
+    fakes["plan"].result = QueryPlan(route="hybrid_single", reason="r")
+    fakes["coverage"].result = CoverageReport(parts=[
+        {"part": "diabetes drugs that interact with blood pressure drugs", "covered": True},
+        {"part": "effect of the interaction", "covered": False},
+    ])
+    first = [_chunk("c1", TMP, 2, 0.81)]
+    repair = [_chunk("c1", TMP, 2, 0.81),                                  # already in context
+              _chunk("r1", "interactions.pdf", 1, 0.77, text="ACE inhibitors raise hypoglycemia risk"),
+              _chunk("r2", "interactions.pdf", 2, 0.40, text="unrelated passage")]
+    fakes["vector"].result = lambda q, top_k: repair if q == "effect of the interaction" else first
+    fakes["answer"].result = lambda q, ctx, provider, required_parts=None: (
+        "complete answer" if required_parts else "draft answer")
+
+
+def test_missing_part_triggers_targeted_search_and_one_regeneration(app):
+    client, fakes = app
+    _multi_part(fakes)
+
+    body = client.post("/query", json={"question": "diabetes drugs vs BP drugs: which interact, what happens?",
+                                       "force_no_gds": True}).json()
+
+    assert body["answer"] == "complete answer"
+    assert len(fakes["answer"].calls) == 2                               # draft + one repair
+    assert fakes["answer"].calls[1][1]["required_parts"] == [
+        "diabetes drugs that interact with blood pressure drugs", "effect of the interaction"]
+    # the targeted search ran for the missing part only
+    assert [c[0][0] for c in fakes["vector"].calls][-1] == "effect of the interaction"
+    # new chunks (not the duplicate) reach the context, provenance and response
+    assert any("ACE inhibitors raise hypoglycemia risk" in c for c in body["retrieved_contexts"])
+    assert sum("text of c1" in c for c in body["retrieved_contexts"]) == 1
+    assert ("interactions.pdf", 1) in {(p["source"], p["page"]) for p in body["provenance"]
+                                       if p["type"] == "document"}
+    (_, regenerated_context), _ = fakes["answer"].calls[1]
+    assert regenerated_context == "\n\n".join(body["retrieved_contexts"])
+    assert body["completeness"]["missing"] == ["effect of the interaction"]
+    assert body["completeness"]["repaired"] is True
+    assert "interactions.pdf p.1" in body["completeness"]["added_sources"]
+
+
+def test_fully_covered_answer_is_not_regenerated(app):
+    client, fakes = app
+    fakes["plan"].result = QueryPlan(route="hybrid_single", reason="r")
+    fakes["coverage"].result = CoverageReport(parts=[{"part": "side effects of metformin", "covered": True}])
+
+    body = client.post("/query", json={"question": "metformin side effects", "force_no_gds": True}).json()
+
+    assert len(fakes["answer"].calls) == 1
+    assert body["completeness"] == {"parts": ["side effects of metformin"], "missing": [],
+                                    "repaired": False, "added_sources": []}
+
+
+def test_single_part_definition_question_skips_the_check(app):
+    client, fakes = app   # route vector_only, no sub-queries
+    body = client.post("/query", json={"question": "What is metformin?"}).json()
+    assert fakes["coverage"].calls == []
+    assert body["completeness"] is None
+
+
+def test_completeness_check_can_be_turned_off(app):
+    client, fakes = app
+    _multi_part(fakes)
+    body = client.post("/query", json={"question": "q", "use_completeness_check": False,
+                                       "force_no_gds": True}).json()
+    assert fakes["coverage"].calls == [] and len(fakes["answer"].calls) == 1
+    assert body["answer"] == "draft answer"
 
 
 def test_merge_round_robin_interleaves_and_dedupes():
