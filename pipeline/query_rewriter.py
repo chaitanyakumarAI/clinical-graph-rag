@@ -55,9 +55,14 @@ class RewrittenQuery(BaseModel):
     rewritten:   str
     sub_queries: List[str] = []
 
-    @field_validator("sub_queries")
+    # mode="before": clean the raw LLM value before type validation, so one
+    # malformed item (a number, an object) is dropped instead of failing the
+    # whole rewrite.
+    @field_validator("sub_queries", mode="before")
     @classmethod
     def limit_sub_queries(cls, v):
+        if not isinstance(v, list):
+            return []
         return [q.strip() for q in v if isinstance(q, str) and q.strip()][:MAX_SUB_QUERIES]
 
     @property
