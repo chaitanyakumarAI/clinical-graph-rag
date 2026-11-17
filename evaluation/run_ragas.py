@@ -13,6 +13,12 @@ Usage (from the project root, Neo4j + Qdrant running, sample PDFs ingested):
     python evaluation/run_ragas.py answer     # only step 1
     python evaluation/run_ragas.py judge      # only step 2
 
+    # Completeness check before/after on the multi-hop questions only,
+    # written to a separate folder so the original results stay untouched:
+    python evaluation/run_ragas.py --category multi-hop \\
+        --configs rewrite completeness --out evaluation/results/fork
+    python evaluation/compare.py evaluation/results/fork
+
 Judge models are separate from the answering model (gpt-oss-120b). Groq's free
 tier allows 200K tokens/day PER MODEL, and judging all metrics needs more than
 that, so the metrics are split across two judge models (see METRIC_JUDGES).
@@ -48,9 +54,12 @@ METRIC_JUDGES = {
 }
 JUDGE_MAX_TOKENS = {"qwen/qwen3.8-27b": 900}
 CONFIGS = {
-    "baseline": {"use_query_rewrite": False},
-    "rewrite":  {"use_query_rewrite": True},
+    "baseline":     {"use_query_rewrite": False, "use_completeness_check": False},
+    "rewrite":      {"use_query_rewrite": True,  "use_completeness_check": False},
+    # Fork addition: rewrite + check that every part of the question is answered
+    "completeness": {"use_query_rewrite": True,  "use_completeness_check": True},
 }
+DEFAULT_CONFIGS = ["baseline", "rewrite"]   # the original evaluation
 METRIC_NAMES = ["faithfulness", "answer_relevancy", "context_recall", "answer_correctness"]
 
 
@@ -83,12 +92,13 @@ def _record_usage(step):
 
 # ── Step 1: generate answers ──────────────────────────────────────────────────
 
-def run_answers(testset):
+def run_answers(testset, configs):
     from fastapi.testclient import TestClient
     import backend.main as backend
 
     client = TestClient(backend.app)
-    for config, options in CONFIGS.items():
+    for config in configs:
+        options = CONFIGS[config]
         path    = os.path.join(RESULTS_DIR, f"answers_{config}.json")
         answers = _load_json(path, {})
         for item in testset:
@@ -111,6 +121,7 @@ def run_answers(testset):
                 "retrieved_contexts": data["retrieved_contexts"],
                 "vector_sources":     data["vector_sources"],
                 "route":              data["route"],
+                "completeness":       data.get("completeness"),
                 "latency_s":          round(time.time() - t0, 1),
             }
             _save_json(path, answers)
@@ -165,7 +176,7 @@ def _make_metrics():
     ]
 
 
-def run_judge(testset):
+def run_judge(testset, configs):
     from ragas import EvaluationDataset, evaluate
     from ragas.run_config import RunConfig
 
@@ -173,11 +184,13 @@ def run_judge(testset):
     run_config = RunConfig(max_workers=1, timeout=900, max_retries=2)
     references = {item["id"]: item["reference"] for item in testset}
 
-    for config in CONFIGS:
+    for config in configs:
         answers = _load_json(os.path.join(RESULTS_DIR, f"answers_{config}.json"), {})
         path    = os.path.join(RESULTS_DIR, f"scores_{config}.json")
         scores  = _load_json(path, {})
         for qid, ans in answers.items():
+            if qid not in references:
+                continue   # outside the --ids / --category selection
             if qid in scores and not any(math.isnan(scores[qid].get(m, float("nan"))) for m in METRIC_NAMES):
                 continue   # already scored
             print(f"\n=== judging [{config}] {qid}", flush=True)
@@ -197,23 +210,39 @@ def run_judge(testset):
             print("   ", {m: round(v, 3) for m, v in scores[qid].items()}, flush=True)
             _save_json(path, scores)
 
-    missing = [(c, q) for c in CONFIGS for q, s in
+    missing = [(c, q) for c in configs for q, s in
                _load_json(os.path.join(RESULTS_DIR, f"scores_{c}.json"), {}).items()
-               if any(math.isnan(v) for v in s.values())]
+               if q in references and any(math.isnan(v) for v in s.values())]
     print(f"\nJudge step done. Missing scores (re-run to retry): {missing or 'none'}")
     print("LLM usage:", usage_summary())
     return not missing
 
 
 if __name__ == "__main__":
-    step    = sys.argv[1] if len(sys.argv) > 1 else "all"
-    testset = _load_json(TESTSET_PATH, [])
+    import argparse
+    parser = argparse.ArgumentParser(description="Evaluate the RAG pipeline with RAGAS.")
+    parser.add_argument("step", nargs="?", default="all", choices=["all", "answer", "judge"])
+    parser.add_argument("--configs", nargs="+", default=DEFAULT_CONFIGS, choices=list(CONFIGS),
+                        help="pipeline configurations to run (default: baseline rewrite)")
+    parser.add_argument("--category", nargs="+",
+                        help="only questions of these categories, e.g. multi-hop")
+    parser.add_argument("--ids", nargs="+", help="only these question ids, e.g. Q8 Q9")
+    parser.add_argument("--out", default=RESULTS_DIR,
+                        help="results directory (default: evaluation/results)")
+    args = parser.parse_args()
+
+    RESULTS_DIR = os.path.abspath(args.out)   # read by every helper above
+    testset = [item for item in _load_json(TESTSET_PATH, [])
+               if (not args.category or item["category"] in args.category)
+               and (not args.ids or item["id"] in args.ids)]
+    print(f"{len(testset)} question(s), configs={args.configs}, results → {RESULTS_DIR}")
+
     ok = True
-    if step in ("all", "answer"):
-        ok = run_answers(testset)
-    if ok and step in ("all", "judge"):
+    if args.step in ("all", "answer"):
+        ok = run_answers(testset, args.configs)
+    if ok and args.step in ("all", "judge"):
         try:
-            ok = run_judge(testset)
+            ok = run_judge(testset, args.configs)
         finally:
             _record_usage("judge")
     sys.exit(0 if ok else 2)
