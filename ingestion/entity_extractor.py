@@ -34,7 +34,7 @@ from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
 
 from ingestion.ontology_validator import validate_triple as _validate_triple
-from llm import RateLimitExhausted, chat_json
+from llm import RateLimitExhausted, chat_json, model_for, resolve_provider
 
 load_dotenv()
 
@@ -233,14 +233,43 @@ CACHE_DIR = os.path.join(
 )
 
 
-def _cache_path(text: str) -> str:
-    digest = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:16]
+def _extraction_model(provider: str) -> str:
+    """The model that would extract this chunk (EXTRACTION_MODEL or the provider default)."""
+    if os.getenv("EXTRACTION_MODEL"):
+        return os.environ["EXTRACTION_MODEL"]
+    try:
+        return model_for(resolve_provider(provider))
+    except (EnvironmentError, ValueError):
+        return "unconfigured"
+
+
+def _cache_fingerprint(provider: str = "auto") -> str:
+    """
+    Hash of everything besides the chunk text that shapes a cached result:
+    the model, the prompts, the allowed types, the ontology and the confidence
+    thresholds (the cache stores results *after* validation). Changing any of
+    them changes every cache key, so stale extractions are never reused.
+    """
+    from ingestion.ontology_validator import ONTOLOGY
+    settings = {
+        "model":      _extraction_model(provider),
+        "prompts":    [SYSTEM_PROMPT, USER_PROMPT_TEMPLATE],
+        "types":      [sorted(VALID_ENTITY_TYPES), sorted(VALID_RELATION_TYPES)],
+        "ontology":   {p: [sorted(d), sorted(r)] for p, (d, r) in sorted(ONTOLOGY.items())},
+        "thresholds": [MIN_ENTITY_CONFIDENCE, MIN_RELATION_CONFIDENCE],
+    }
+    return hashlib.sha256(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def _cache_path(text: str, fingerprint: str) -> str:
+    key = f"{fingerprint}\n{text.strip()}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
     return os.path.join(CACHE_DIR, f"{digest}.json")
 
 
-def _load_cached(text: str) -> Optional[dict]:
+def _load_cached(text: str, fingerprint: str) -> Optional[dict]:
     """Return the cached {"entities": [...], "relations": [...]} for this text, if any."""
-    path = _cache_path(text)
+    path = _cache_path(text, fingerprint)
     if not os.path.exists(path):
         return None
     try:
@@ -250,12 +279,13 @@ def _load_cached(text: str) -> Optional[dict]:
         return None
 
 
-def _save_cached(text: str, entities: List[ExtractedEntity],
+def _save_cached(text: str, fingerprint: str, entities: List[ExtractedEntity],
                  relations: List[ExtractedRelation]) -> None:
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(_cache_path(text), "w", encoding="utf-8") as f:
+        with open(_cache_path(text, fingerprint), "w", encoding="utf-8") as f:
             json.dump({
+                "fingerprint": fingerprint,
                 "entities":  [e.model_dump() for e in entities],
                 "relations": [r.model_dump() for r in relations],
             }, f, indent=2)
@@ -339,7 +369,8 @@ def extract_from_chunk(
         paragraph_index = chunk.get("chunk_index", 0),
     )
 
-    cached = _load_cached(text) if use_cache else None
+    fingerprint = _cache_fingerprint(provider) if use_cache else ""
+    cached = _load_cached(text, fingerprint) if use_cache else None
     if cached is not None:
         result.entities  = [ExtractedEntity(**e)   for e in cached.get("entities", [])]
         result.relations = [ExtractedRelation(**r) for r in cached.get("relations", [])]
@@ -360,7 +391,7 @@ def extract_from_chunk(
 
     result.entities, result.relations = _parse_and_validate(raw, text)
     if use_cache:
-        _save_cached(text, result.entities, result.relations)
+        _save_cached(text, fingerprint, result.entities, result.relations)
     return result
 
 
