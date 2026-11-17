@@ -1,0 +1,17 @@
+# Lightweight dependencies for the unit tests and CI.
+#
+# The tests mock every LLM, Neo4j and Qdrant call, and torch /
+# sentence-transformers are only imported lazily, so the full requirements.txt
+# (≈2 GB with torch) is not needed to run them:
+#     pip install -r requirements-dev.txt
+#     pytest
+fastapi==0.163.2
+httpx==0.28.1
+neo4j==6.4.1
+numpy==2.5.5
+openai==1.109.1
+pydantic==2.14.3
+pytest==9.2.0
+python-dotenv==1.2.4
+python-multipart==0.0.34
+rapidfuzz==3.14.6
