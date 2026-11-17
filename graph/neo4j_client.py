@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
-from neo4j import GraphDatabase
+from neo4j import GraphDatabase, unit_of_work
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -407,12 +407,20 @@ class Neo4jClient:
         with self.driver.session() as s:
             return [r.data() for r in s.run(cypher, params or {})]
 
-    def run_read_query(self, cypher: str, params: Dict = None) -> List[Dict]:
-        """Run a query in a READ transaction — Neo4j refuses any write in it."""
+    def run_read_query(self, cypher: str, params: Dict = None,
+                       timeout: Optional[float] = None) -> List[Dict]:
+        """
+        Run a query in a READ transaction — Neo4j refuses any write in it.
+
+        `timeout` (seconds) is enforced by the server: the transaction is
+        cancelled if it runs longer.
+        """
+        @unit_of_work(timeout=timeout)
+        def work(tx):
+            return [r.data() for r in tx.run(cypher, params or {})]
+
         with self.driver.session() as s:
-            return s.execute_read(
-                lambda tx: [r.data() for r in tx.run(cypher, params or {})]
-            )
+            return s.execute_read(work)
 
     def get_node_counts(self) -> Dict[str, int]:
         counts = {}

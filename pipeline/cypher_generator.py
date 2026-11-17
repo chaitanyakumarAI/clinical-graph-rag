@@ -13,6 +13,7 @@ Safety rules enforced on all generated queries:
 """
 
 from __future__ import annotations
+import os
 import re
 from typing import List, Dict, TYPE_CHECKING
 
@@ -76,6 +77,17 @@ _WRITE_KEYWORDS = re.compile(
 )
 
 
+_MAX_LIMIT = 200   # hard cap on rows a generated query may return
+
+# The query must END with "LIMIT <number|$param>". A bare `"LIMIT" in q` test
+# was fooled by text such as n.name = 'LIMITLESS' or a LIMIT inside a WITH.
+_TRAILING_LIMIT = re.compile(r"\bLIMIT\s+(\$\w+|\d+)\s*;?\s*$", re.IGNORECASE)
+
+# Generated queries run with this server-side timeout (seconds), so a runaway
+# variable-length path query is cancelled by Neo4j instead of hanging /query.
+CYPHER_TIMEOUT_SECONDS = float(os.getenv("CYPHER_TIMEOUT_SECONDS", 10))
+
+
 def _is_safe_cypher(query: str) -> bool:
     """
     Validate that a Cypher query is read-only and has required clauses.
@@ -86,13 +98,18 @@ def _is_safe_cypher(query: str) -> bool:
         return False
     if _WRITE_KEYWORDS.search(q):
         return False
-    return "LIMIT" in q
+    return bool(_TRAILING_LIMIT.search(q))
 
 
 def _inject_limit_if_missing(query: str, limit: int) -> str:
-    """Add LIMIT clause if not present."""
-    if "LIMIT" not in query.upper():
-        return f"{query.rstrip()} LIMIT {limit}"
+    """Ensure the query ends with a LIMIT, and cap literal limits at _MAX_LIMIT."""
+    query = query.strip().rstrip(";").rstrip()
+    match = _TRAILING_LIMIT.search(query)
+    if not match:
+        return f"{query} LIMIT {min(limit, _MAX_LIMIT)}"
+    value = match.group(1)
+    if value.isdigit() and int(value) > _MAX_LIMIT:
+        return f"{query[:match.start(1)]}{_MAX_LIMIT}"
     return query
 
 
@@ -185,7 +202,7 @@ def execute_first_nonempty(
     """
     for i, query in enumerate(queries):
         try:
-            rows = client.run_read_query(query, params)
+            rows = client.run_read_query(query, params, timeout=CYPHER_TIMEOUT_SECONDS)
             if rows:
                 print(f"[cypher_generator] Query {i+1}/{len(queries)} returned "
                       f"{len(rows)} rows ✅")

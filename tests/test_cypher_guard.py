@@ -60,6 +60,23 @@ def test_query_without_limit_is_rejected_until_one_is_injected():
     assert _inject_limit_if_missing(fixed, 99) == fixed   # existing LIMIT kept
 
 
+@pytest.mark.parametrize("query", [
+    "MATCH (n) WHERE n.name = 'LIMITLESS' RETURN n",          # the word inside a string
+    "MATCH (n) WITH n LIMIT 5 MATCH (n)--(m) RETURN m",       # LIMIT only on an inner WITH
+])
+def test_limit_must_be_the_final_clause(query):
+    assert not _is_safe_cypher(query)
+    fixed = _inject_limit_if_missing(query, 25)
+    assert fixed.endswith(" LIMIT 25") and _is_safe_cypher(fixed)
+
+
+def test_huge_literal_limit_is_capped():
+    assert _inject_limit_if_missing("MATCH (n) RETURN n LIMIT 1000000", 25) == \
+        f"MATCH (n) RETURN n LIMIT {cypher_generator._MAX_LIMIT}"
+    assert _inject_limit_if_missing("MATCH (n) RETURN n LIMIT 50;", 25) == "MATCH (n) RETURN n LIMIT 50"
+    assert _inject_limit_if_missing("MATCH (n) RETURN n", 10_000).endswith(f"LIMIT {cypher_generator._MAX_LIMIT}")
+
+
 def test_generate_cypher_keeps_only_safe_string_candidates(monkeypatch, fake_llm):
     monkeypatch.setattr(cypher_generator, "chat_json", fake_llm({"queries": [
         "MATCH (a {name: $entity1})-[r:CAUSES]->(b) RETURN a, r, b",   # LIMIT gets injected
@@ -94,9 +111,11 @@ class _FakeNeo4j:
     def __init__(self, results):
         self.results = list(results)
         self.read_calls = []
+        self.timeouts = []
 
-    def run_read_query(self, cypher, params=None):
+    def run_read_query(self, cypher, params=None, timeout=None):
         self.read_calls.append((cypher, params))
+        self.timeouts.append(timeout)
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -113,7 +132,32 @@ def test_execute_first_nonempty_uses_read_transactions_and_skips_failures():
 
     assert rows == [{"source": "A"}]
     assert [c[0] for c in client.read_calls] == ["q1", "q2", "q3"]
+    assert client.timeouts == [cypher_generator.CYPHER_TIMEOUT_SECONDS] * 3
 
 
 def test_execute_first_nonempty_all_empty():
     assert execute_first_nonempty(["q1"], _FakeNeo4j([[]]), {}) == []
+
+
+def test_run_read_query_uses_read_transaction_with_server_timeout():
+    from graph.neo4j_client import Neo4jClient
+
+    seen = {}
+
+    class Session:
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+
+        def execute_read(self, work):
+            seen["timeout"] = getattr(work, "timeout", None)
+            tx = type("Tx", (), {"run": lambda self, c, p: [type("R", (), {"data": lambda s: {"ok": 1}})()]})()
+            return work(tx)
+
+        def run(self, *a, **k):  # pragma: no cover - auto-commit (write-capable) path
+            raise AssertionError("must use execute_read")
+
+    client = Neo4jClient.__new__(Neo4jClient)
+    client.driver = type("D", (), {"session": lambda self, **kw: Session()})()
+
+    assert client.run_read_query("MATCH (n) RETURN n LIMIT 1", timeout=7.5) == [{"ok": 1}]
+    assert seen["timeout"] == 7.5
