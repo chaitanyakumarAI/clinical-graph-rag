@@ -122,6 +122,23 @@ def delete_document(sha256: str, client: "Neo4jClient") -> Dict:
 
     filename = rows[0]["filename"]
 
+    # Step 1b: chunks only this document owns, and the temp-file sources they carry
+    owned = client.run_query(
+        """
+        MATCH (d:Document {sha256: $sha256})-[:HAS_CHUNK]->(c:Chunk)
+        WHERE NOT EXISTS {
+            MATCH (other:Document)-[:HAS_CHUNK]->(c)
+            WHERE other.sha256 <> $sha256
+        }
+        RETURN collect(c.chunk_id) AS chunk_ids, collect(DISTINCT c.source) AS sources
+        """,
+        {"sha256": sha256},
+    )
+    owned_ids     = owned[0]["chunk_ids"] if owned else []
+    owned_sources = [s for s in (owned[0]["sources"] if owned else []) if s]
+    if owned_ids:
+        _remove_chunk_provenance(client, owned_ids, owned_sources)
+
     # Step 2: delete Chunk nodes exclusively owned by this document
     del_chunks_result = client.run_query(
         """
@@ -152,6 +169,43 @@ def delete_document(sha256: str, client: "Neo4jClient") -> Dict:
         "doc_deleted":   True,
         "error":         None,
     }
+
+
+def _remove_chunk_provenance(client: "Neo4jClient", chunk_ids: list, sources: list) -> None:
+    """
+    Remove a deleted document's provenance from the shared graph.
+
+    Entities and relations accumulate chunk_ids/sources from every PDF that
+    mentions them (see neo4j_client._union), so deleting one PDF must take its
+    entries back out; otherwise shared nodes keep citing chunks that no longer
+    exist. Evidence nodes are one per (triple, chunk), so those that point at
+    the deleted chunks are removed outright.
+
+    The entities/relations themselves are kept, as before: graphs built before
+    provenance accumulated have incomplete chunk_ids, so "no chunk_ids left" is
+    not a safe signal that no other document supports a fact.
+    """
+    params = {"ids": chunk_ids, "sources": sources}
+    client.run_query(
+        """
+        MATCH (ev:Evidence)-[:FROM_CHUNK]->(c:Chunk)
+        WHERE c.chunk_id IN $ids
+        DETACH DELETE ev
+        """,
+        params,
+    )
+    strip = """
+        SET x.chunk_ids = [cid IN x.chunk_ids WHERE NOT cid IN $ids],
+            x.sources   = [s IN coalesce(x.sources, []) WHERE NOT s IN $sources]
+    """
+    client.run_query(
+        "MATCH (x) WHERE any(cid IN coalesce(x.chunk_ids, []) WHERE cid IN $ids)" + strip,
+        params,
+    )
+    client.run_query(
+        "MATCH ()-[x]->() WHERE any(cid IN coalesce(x.chunk_ids, []) WHERE cid IN $ids)" + strip,
+        params,
+    )
 
 
 def purge_legacy_documents(client: "Neo4jClient") -> Dict:

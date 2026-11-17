@@ -49,6 +49,29 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _union(existing: str, new: str) -> str:
+    """
+    Cypher expression: `existing` list plus the items of `new` it doesn't have yet.
+
+    Pure Cypher (no APOC), order-preserving, and idempotent, so ingesting a
+    second PDF adds its provenance to shared entities/edges instead of
+    replacing the first PDF's, and re-ingesting the same PDF changes nothing.
+    """
+    return (f"reduce(acc = [], x IN coalesce({existing}, []) + coalesce({new}, []) | "
+            f"CASE WHEN x IN acc THEN acc ELSE acc + x END)")
+
+
+def _max_conf(existing: str, new: str) -> str:
+    """
+    Cypher expression: the higher of two confidences.
+
+    A fact stated confidently in any document stays confident. Unlike the old
+    running average ((old + new) / 2), the result doesn't depend on the order
+    documents were ingested in and doesn't drift when one is re-ingested.
+    """
+    return f"CASE WHEN {existing} IS NULL OR {new} > {existing} THEN {new} ELSE {existing} END"
+
+
 class Neo4jClient:
     def __init__(self):
         self.driver = GraphDatabase.driver(
@@ -136,15 +159,11 @@ class Neo4jClient:
         ts    = extracted_at or _now_iso()
         cypher = f"""
         MERGE (n:{label} {{name: $name}})
-        SET n.aliases      = $aliases,
-            n.sources      = $sources,
-            n.confidence   = CASE WHEN n.confidence IS NULL
-                               THEN $confidence
-                               ELSE (n.confidence + $confidence) / 2.0 END,
-            n.chunk_ids    = apoc.coll.toSet(
-                                coalesce(n.chunk_ids, []) + $chunk_ids),
-            n.pages        = apoc.coll.toSet(
-                                coalesce(n.pages, []) + $pages),
+        SET n.aliases      = {_union("n.aliases", "$aliases")},
+            n.sources      = {_union("n.sources", "$sources")},
+            n.confidence   = {_max_conf("n.confidence", "$confidence")},
+            n.chunk_ids    = {_union("n.chunk_ids", "$chunk_ids")},
+            n.pages        = {_union("n.pages", "$pages")},
             n.stage        = $stage,
             n.extracted_at = CASE WHEN n.extracted_at IS NULL
                                THEN $extracted_at ELSE n.extracted_at END,
@@ -190,18 +209,16 @@ class Neo4jClient:
                     }
                     for e in batch
                 ]
-                # Note: apoc.coll.toSet requires APOC plugin.
-                # If APOC is not available, fall back to simple SET (no accumulation).
+                # Lists are unioned, not replaced: entities shared by several
+                # PDFs keep the provenance of every PDF (no APOC needed).
                 cypher = f"""
                 UNWIND $rows AS row
                 MERGE (n:{label} {{name: row.name}})
-                SET n.aliases      = row.aliases,
-                    n.sources      = row.sources,
-                    n.confidence   = CASE WHEN n.confidence IS NULL
-                                       THEN row.confidence
-                                       ELSE (n.confidence + row.confidence) / 2.0 END,
-                    n.chunk_ids    = row.chunk_ids,
-                    n.pages        = row.pages,
+                SET n.aliases      = {_union("n.aliases", "row.aliases")},
+                    n.sources      = {_union("n.sources", "row.sources")},
+                    n.confidence   = {_max_conf("n.confidence", "row.confidence")},
+                    n.chunk_ids    = {_union("n.chunk_ids", "row.chunk_ids")},
+                    n.pages        = {_union("n.pages", "row.pages")},
                     n.stage        = row.stage,
                     n.extracted_at = CASE WHEN n.extracted_at IS NULL
                                        THEN row.extracted_at ELSE n.extracted_at END,
@@ -235,11 +252,11 @@ class Neo4jClient:
         MERGE (a:{subj_label} {{name: $subj}})
         MERGE (b:{obj_label}  {{name: $obj}})
         MERGE (a)-[r:{rel_type}]->(b)
-        SET r.confidence    = $confidence,
-            r.chunk_ids     = $chunk_ids,
-            r.sources       = $sources,
-            r.page_numbers  = $page_numbers,
-            r.paragraph_ids = $paragraph_ids,
+        SET r.confidence    = {_max_conf("r.confidence", "$confidence")},
+            r.chunk_ids     = {_union("r.chunk_ids", "$chunk_ids")},
+            r.sources       = {_union("r.sources", "$sources")},
+            r.page_numbers  = {_union("r.page_numbers", "$page_numbers")},
+            r.paragraph_ids = {_union("r.paragraph_ids", "$paragraph_ids")},
             r.stage         = $stage,
             r.extracted_at  = CASE WHEN r.extracted_at IS NULL
                                 THEN $extracted_at ELSE r.extracted_at END,
@@ -294,11 +311,11 @@ class Neo4jClient:
                     MERGE (a:{subj_label} {{name: row.subj}})
                     MERGE (b:{obj_label}  {{name: row.obj}})
                     MERGE (a)-[r:{rel_type}]->(b)
-                    SET r.confidence    = row.confidence,
-                        r.chunk_ids     = row.chunk_ids,
-                        r.sources       = row.sources,
-                        r.page_numbers  = row.page_numbers,
-                        r.paragraph_ids = row.paragraph_ids,
+                    SET r.confidence    = {_max_conf("r.confidence", "row.confidence")},
+                        r.chunk_ids     = {_union("r.chunk_ids", "row.chunk_ids")},
+                        r.sources       = {_union("r.sources", "row.sources")},
+                        r.page_numbers  = {_union("r.page_numbers", "row.page_numbers")},
+                        r.paragraph_ids = {_union("r.paragraph_ids", "row.paragraph_ids")},
                         r.stage         = row.stage,
                         r.extracted_at  = CASE WHEN r.extracted_at IS NULL
                                             THEN row.extracted_at ELSE r.extracted_at END,

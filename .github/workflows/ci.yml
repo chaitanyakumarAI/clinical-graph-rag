@@ -11,6 +11,23 @@ jobs:
   backend-tests:
     name: Backend unit tests
     runs-on: ubuntu-latest
+    # A throwaway Neo4j for the provenance integration test
+    # (tests/test_provenance.py); every other test is fully mocked.
+    services:
+      neo4j:
+        image: neo4j:5
+        env:
+          NEO4J_AUTH: neo4j/ci-test-password
+        ports:
+          - 7687:7687
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p ci-test-password 'RETURN 1'"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 20
+    env:
+      NEO4J_TEST_URI: bolt://localhost:7687
+      NEO4J_TEST_PASSWORD: ci-test-password
     steps:
       - uses: actions/checkout@v4
 
