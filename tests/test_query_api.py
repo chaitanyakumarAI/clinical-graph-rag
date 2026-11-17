@@ -155,6 +155,49 @@ def test_exhausted_quota_becomes_429(app):
     assert "groq" in r.json()["detail"]
 
 
+def _raise(exc):
+    def raiser(*args, **kwargs):
+        raise exc
+    return raiser
+
+
+def test_qdrant_down_becomes_503(app):
+    from vector.qdrant_client import VectorStoreUnavailable
+    client, fakes = app
+    fakes["vector"].result = _raise(VectorStoreUnavailable("Cannot reach Qdrant"))
+
+    r = client.post("/query", json={"question": "q"})
+
+    assert r.status_code == 503
+    assert r.json()["service"] == "Qdrant"
+    assert "QDRANT_URL" in r.json()["detail"]
+
+
+def test_neo4j_down_becomes_503(app):
+    import neo4j.exceptions
+    client, fakes = app
+    fakes["plan"].result = QueryPlan(route="hybrid_single", reason="r", entities_mentioned=["Metformin"])
+    fakes["link"].result = _raise(neo4j.exceptions.ServiceUnavailable("Couldn't connect to localhost:7687"))
+
+    r = client.post("/query", json={"question": "q"})
+
+    assert r.status_code == 503
+    assert r.json()["service"] == "Neo4j"
+
+
+def test_qdrant_transport_error_is_wrapped():
+    pytest.importorskip("qdrant_client")
+    from qdrant_client.http.exceptions import ResponseHandlingException
+    from vector import qdrant_client as store_module
+
+    store = store_module.QdrantStore.__new__(store_module.QdrantStore)
+    store.collection = "medical_chunks"
+    store.client = type("C", (), {"query_points": _raise(ResponseHandlingException(ConnectionError("refused")))})()
+
+    with pytest.raises(store_module.VectorStoreUnavailable, match="Cannot reach Qdrant"):
+        store.search([0.0] * 3)
+
+
 def test_merge_round_robin_interleaves_and_dedupes():
     lists = [
         [{"chunk_id": "a"}, {"chunk_id": "b"}, {"chunk_id": "c"}],

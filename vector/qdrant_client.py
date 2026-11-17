@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from contextlib import contextmanager
 from typing import List, Dict
 
 from dotenv import load_dotenv
@@ -20,13 +21,29 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "medical_chunks")
 
 
+class VectorStoreUnavailable(RuntimeError):
+    """Qdrant could not be reached (not running, wrong QDRANT_URL, network)."""
+
+
+@contextmanager
+def _raise_if_unreachable():
+    """Turn Qdrant transport failures into VectorStoreUnavailable (→ HTTP 503)."""
+    from qdrant_client.http.exceptions import ResponseHandlingException
+    try:
+        yield
+    except ResponseHandlingException as exc:
+        raise VectorStoreUnavailable(
+            f"Cannot reach Qdrant at {QDRANT_URL}: {exc}") from exc
+
+
 class QdrantStore:
     def __init__(self, collection: str = COLLECTION_NAME):
         from qdrant_client import QdrantClient
 
         self.collection = collection
         self.client = QdrantClient(url=QDRANT_URL)
-        self._ensure_collection()
+        with _raise_if_unreachable():
+            self._ensure_collection()
 
     def _ensure_collection(self):
         from qdrant_client.models import Distance, VectorParams
@@ -79,10 +96,11 @@ class QdrantStore:
                 )
 
             if points:
-                self.client.upsert(
-                    collection_name=self.collection,
-                    points=points,
-                )
+                with _raise_if_unreachable():
+                    self.client.upsert(
+                        collection_name=self.collection,
+                        points=points,
+                    )
 
         print(f"[qdrant] ✅ Upserted {len(chunks)} chunks into '{self.collection}'")
 
@@ -99,12 +117,13 @@ class QdrantStore:
             List of dictionaries containing chunk_id, text, source, page and score.
         """
 
-        response = self.client.query_points(
-            collection_name=self.collection,
-            query=query_embedding,
-            limit=top_k,
-            score_threshold=score_threshold,
-        )
+        with _raise_if_unreachable():
+            response = self.client.query_points(
+                collection_name=self.collection,
+                query=query_embedding,
+                limit=top_k,
+                score_threshold=score_threshold,
+            )
 
         results = response.points
 

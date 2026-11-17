@@ -26,6 +26,7 @@ import sys
 import time
 from typing import List, Optional, Dict
 
+import neo4j.exceptions
 import openai
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,6 +47,7 @@ from pipeline.graph_retriever   import retrieve_subgraph, format_subgraph_for_co
 from pipeline.vector_retriever  import retrieve_vector_context
 from pipeline.reranker          import fuse_and_rerank
 from pipeline.generator         import generate_answer
+from vector.qdrant_client       import VectorStoreUnavailable
 
 app = FastAPI(
     title="Medical Graph RAG API",
@@ -96,6 +98,31 @@ def llm_api_error_handler(_request: Request, exc: openai.APIStatusError):
         content={"detail": f"LLM provider error ({exc.status_code}): {exc.message}."
                            f"{hints.get(exc.status_code, '')}"},
     )
+
+
+def _store_unavailable(service: str, hint: str, exc: Exception) -> JSONResponse:
+    print(f"[main] {service} unavailable: {exc}")
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"{service} is not reachable. {hint}", "service": service},
+    )
+
+
+@app.exception_handler(VectorStoreUnavailable)
+def qdrant_unavailable_handler(_request: Request, exc: VectorStoreUnavailable):
+    """Qdrant down → 503 with a hint, instead of a bare 500."""
+    return _store_unavailable(
+        "Qdrant", "Start it (docker run -p 6333:6333 qdrant/qdrant) or check QDRANT_URL in .env.", exc)
+
+
+@app.exception_handler(neo4j.exceptions.ServiceUnavailable)
+def neo4j_unavailable_handler(_request: Request, exc: neo4j.exceptions.ServiceUnavailable):
+    return _store_unavailable("Neo4j", "Start it or check NEO4J_URI in .env.", exc)
+
+
+@app.exception_handler(neo4j.exceptions.AuthError)
+def neo4j_auth_handler(_request: Request, exc: neo4j.exceptions.AuthError):
+    return _store_unavailable("Neo4j", "Authentication failed: check NEO4J_USER / NEO4J_PASSWORD in .env.", exc)
 
 
 # Shared Neo4j client (connection pool)
