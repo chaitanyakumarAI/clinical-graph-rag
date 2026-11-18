@@ -1,27 +1,66 @@
 import { useEffect, useState } from 'react'
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts'
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, LabelList } from 'recharts'
+import { Icon } from './Icon'
+import { ENTITY_TYPES, typeVar, humanType } from './entityTypes'
 
 // API base — relative so Vite proxy (dev) and FastAPI static (prod) both work
 const API = ''
 
-const NODE_COLORS = {
-  Disease:'#f85149', Drug:'#388bfd', Gene:'#3fb950', Protein:'#39d0d8',
-  Pathway:'#d29922', Symptom:'#bc8cff', Treatment:'#58a6ff', SideEffect:'#ff7b72',
-  Organ:'#e3b341', Compound:'#56d364', PatientGroup:'#ffa657',
-}
-const EDGE_COLORS = {
-  TREATS:'#388bfd', CAUSES:'#f85149', TARGETS:'#3fb950', REGULATES:'#39d0d8',
-  INHIBITS:'#ff7b72', ACTIVATES:'#56d364', HAS_SYMPTOM:'#bc8cff',
-  INTERACTS_WITH:'#d29922', BIOMARKER_FOR:'#ffa657', RELATED_TO:'#484f58',
+const relName = r => r.toLowerCase().replace(/_/g, ' ').replace(/^\w/, c => c.toUpperCase())
+
+function ChartTooltip({ active, payload }) {
+  if (!active || !payload?.length) return null
+  const d = payload[0].payload
+  return (
+    <div className="chart-tooltip">
+      <div className="t-name">
+        <span style={{ width: 8, height: 8, borderRadius: 2, background: d.color }} />{d.label}
+      </div>
+      <div className="t-value num">{d.count.toLocaleString()}</div>
+    </div>
+  )
 }
 
-function CustomTooltip({ active, payload, label }) {
-  if (!active || !payload?.length) return null
+// Horizontal bars, largest first, value at the tip. A Table view carries the
+// same numbers for anyone who cannot rely on the bars.
+function BarCard({ title, sub, rows }) {
+  const [view, setView] = useState('chart')
+  const height = rows.length * 30 + 8
   return (
-    <div style={{background:'var(--bg-card)', border:'1px solid var(--border)',
-      borderRadius:8, padding:'8px 12px', fontSize:12}}>
-      <div style={{fontWeight:600, marginBottom:4}}>{label}</div>
-      <div style={{color:'var(--accent-blue)'}}>{payload[0].value.toLocaleString()}</div>
+    <div className="card chart-card">
+      <div className="card-head">
+        <div>
+          <div className="card-title">{title}</div>
+          <div className="card-sub">{sub}</div>
+        </div>
+        <div className="view-switch" role="group" aria-label={`${title} view`}>
+          <button type="button" aria-pressed={view === 'chart'} onClick={() => setView('chart')}>Chart</button>
+          <button type="button" aria-pressed={view === 'table'} onClick={() => setView('table')}>Table</button>
+        </div>
+      </div>
+      <div className="card-pad">
+        {view === 'chart' ? (
+          <ResponsiveContainer width="100%" height={height}>
+            <BarChart data={rows} layout="vertical" margin={{ top: 0, right: 44, left: 0, bottom: 0 }} barCategoryGap={8}>
+              <XAxis type="number" hide domain={[0, 'dataMax']} />
+              <YAxis type="category" dataKey="label" width={128} axisLine={false} tickLine={false}
+                tick={{ fontSize: 12.5, fill: 'var(--text-2)' }} interval={0} />
+              <Tooltip content={<ChartTooltip />} cursor={{ fill: 'var(--surface-2)' }} />
+              <Bar dataKey="count" barSize={16} radius={[0, 4, 4, 0]} isAnimationActive={false}>
+                {rows.map(d => <Cell key={d.label} fill={d.color} />)}
+                <LabelList dataKey="count" position="right" offset={8}
+                  style={{ fontSize: 12, fill: 'var(--text-2)', fontVariantNumeric: 'tabular-nums' }} />
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        ) : (
+          <table className="mini-table">
+            <tbody>
+              {rows.map(d => <tr key={d.label}><td>{d.label}</td><td>{d.count.toLocaleString()}</td></tr>)}
+            </tbody>
+          </table>
+        )}
+      </div>
     </div>
   )
 }
@@ -29,7 +68,6 @@ function CustomTooltip({ active, payload, label }) {
 export function StatsDashboard() {
   const [stats, setStats]       = useState(null)
   const [docs, setDocs]         = useState([])
-  const [health, setHealth]     = useState(null)
   const [loading, setLoading]   = useState(true)
   const [error, setError]       = useState(null)
   const [reload, setReload]     = useState(0)
@@ -42,130 +80,108 @@ export function StatsDashboard() {
     setLoading(true)
     setError(null)
     // allSettled: one failing endpoint should not blank the whole page
-    Promise.allSettled([getJson('/graph/stats'), getJson('/documents'), getJson('/health')])
-      .then(([s, d, h]) => {
+    Promise.allSettled([getJson('/graph/stats'), getJson('/documents')])
+      .then(([s, d]) => {
         setStats(s.status === 'fulfilled' ? s.value : null)
         setDocs(d.status === 'fulfilled' ? d.value.documents || [] : [])
-        setHealth(h.status === 'fulfilled' ? h.value : null)
-        const failed = [s, d, h].filter(r => r.status === 'rejected')
-        if (failed.length === 3) setError('Cannot reach the API. Is the backend running on port 8000?')
+        const failed = [s, d].filter(r => r.status === 'rejected')
+        if (failed.length === 2) setError('Cannot reach the API. Is the backend running on port 8000?')
         else if (failed.length) setError(`Some data could not be loaded: ${failed.map(f => f.reason.message).join('; ')}`)
       })
       .finally(() => setLoading(false))
   }, [reload])
 
-  if (loading) return (
-    <div className="card" style={{textAlign:'center', padding:60}}>
-      <span className="spinner" style={{width:24,height:24}} />
-      <div style={{marginTop:12, color:'var(--text-muted)'}}>Loading stats…</div>
-    </div>
-  )
+  const nodeRows = stats ? Object.entries(stats.nodes).filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => ({ label: humanType(k), count: v, color: ENTITY_TYPES[k] ? typeVar(k) : 'var(--series-other)' })) : []
+  const edgeRows = stats ? Object.entries(stats.edges).filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => ({ label: relName(k), count: v, color: 'var(--accent)' })) : []
+  const totalNodes = nodeRows.reduce((s, d) => s + d.count, 0)
+  const totalEdges = edgeRows.reduce((s, d) => s + d.count, 0)
+  const totalPages = docs.reduce((s, d) => s + (d.pages || 0), 0)
 
-  const nodeData  = stats ? Object.entries(stats.nodes).filter(([,v]) => v > 0)
-    .map(([k,v]) => ({name:k, count:v})) : []
-  const edgeData  = stats ? Object.entries(stats.edges).filter(([,v]) => v > 0)
-    .map(([k,v]) => ({name:k, count:v})) : []
-  const totalNodes = nodeData.reduce((s,d) => s + d.count, 0)
-  const totalEdges = edgeData.reduce((s,d) => s + d.count, 0)
-
-  const apiStatus = !health ? '❌ Offline'
-    : health.status === 'ok' ? '✅ Online' : '⚠️ Degraded'
+  const tiles = [
+    ['Entities',  totalNodes, 'graph',    `${nodeRows.length} types`],
+    ['Relations', totalEdges, 'link',     `${edgeRows.length} types`],
+    ['Documents', docs.length, 'file',    'in the library'],
+    ['Pages',     totalPages, 'layers',   'read and indexed'],
+  ]
 
   return (
-    <div style={{display:'flex', flexDirection:'column', gap:20}}>
+    <div className="page">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">Overview</h1>
+          <p className="page-desc">What the knowledge graph holds right now.</p>
+        </div>
+        <div className="page-actions">
+          <button type="button" className="btn btn-secondary" onClick={() => setReload(n => n + 1)} disabled={loading}>
+            {loading ? <span className="spinner" style={{ width: 14, height: 14 }} /> : <Icon name="refresh" size={15} />}Refresh
+          </button>
+        </div>
+      </div>
 
       {error && (
-        <div className="alert error" role="alert" style={{marginTop:0, display:'flex', alignItems:'center', gap:12}}>
-          <span>⚠️ {error}</span>
-          <button className="btn btn-secondary btn-sm" style={{marginLeft:'auto'}}
-            onClick={() => setReload(n => n + 1)}>↻ Retry</button>
+        <div className="alert error" role="alert" style={{ marginBottom: 20 }}>
+          <Icon name="alert" size={16} /><div className="alert-body">{error}</div>
         </div>
       )}
 
-      {/* Top stats */}
-      <div className="stats-grid" style={{gridTemplateColumns:'repeat(4,1fr)'}}>
-        {[
-          ['Total Nodes', totalNodes.toLocaleString()],
-          ['Total Edges', totalEdges.toLocaleString()],
-          ['Documents',   docs.length],
-          ['API Status',  apiStatus],
-        ].map(([label, val]) => (
-          <div key={label} className="stat-card">
-            <div className="stat-value" style={{fontSize:20}}>{val}</div>
-            <div className="stat-label">{label}</div>
+      <div className="tiles">
+        {tiles.map(([label, value, icon, note]) => (
+          <div key={label} className="tile">
+            <div className="tile-label"><Icon name={icon} size={15} />{label}</div>
+            <div className="tile-value">{loading && !stats ? <span className="skeleton" style={{ display: 'block', width: 60, height: 26 }} /> : value.toLocaleString()}</div>
+            <div className="tile-note">{note}</div>
           </div>
         ))}
       </div>
 
-      {/* Node distribution chart */}
-      {nodeData.length > 0 && (
-        <div className="card">
-          <div className="card-title">Entity Distribution</div>
-          <ResponsiveContainer width="100%" height={200}>
-            <BarChart data={nodeData} margin={{top:0, right:0, left:-10, bottom:0}}>
-              <XAxis dataKey="name" tick={{fontSize:10, fill:'#7d8590'}} />
-              <YAxis tick={{fontSize:10, fill:'#7d8590'}} />
-              <Tooltip content={<CustomTooltip />} />
-              <Bar dataKey="count" radius={[4,4,0,0]}>
-                {nodeData.map(d => (
-                  <Cell key={d.name} fill={NODE_COLORS[d.name] || '#388bfd'} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
+      {(nodeRows.length > 0 || edgeRows.length > 0) && (
+        <div className="overview-grid">
+          {nodeRows.length > 0 && <BarCard title="Entities by type" sub="Colours match the graph" rows={nodeRows} />}
+          {edgeRows.length > 0 && <BarCard title="Relations by type" sub="Directed edges between entities" rows={edgeRows} />}
         </div>
       )}
 
-      {/* Edge distribution chart */}
-      {edgeData.length > 0 && (
-        <div className="card">
-          <div className="card-title">Relationship Distribution</div>
-          <ResponsiveContainer width="100%" height={180}>
-            <BarChart data={edgeData} margin={{top:0, right:0, left:-10, bottom:0}}>
-              <XAxis dataKey="name" tick={{fontSize:9, fill:'#7d8590'}} />
-              <YAxis tick={{fontSize:10, fill:'#7d8590'}} />
-              <Tooltip content={<CustomTooltip />} />
-              <Bar dataKey="count" radius={[4,4,0,0]}>
-                {edgeData.map(d => (
-                  <Cell key={d.name} fill={EDGE_COLORS[d.name] || '#388bfd'} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-
-      {/* Document registry */}
       {docs.length > 0 && (
-        <div className="card">
-          <div className="card-title">📚 Ingested Documents</div>
-          <div style={{display:'flex', flexDirection:'column', gap:8}}>
-            {docs.map(doc => (
-              <div key={doc.sha256}
-                style={{display:'flex', alignItems:'center', gap:12,
-                  padding:'10px 14px', background:'var(--bg-input)',
-                  borderRadius:8, border:'1px solid var(--border)'}}>
-                <div style={{fontSize:20}}>📄</div>
-                <div style={{flex:1}}>
-                  <div style={{fontSize:13, fontWeight:600}}>{doc.filename}</div>
-                  <div style={{fontSize:11, color:'var(--text-muted)', marginTop:2}}>
-                    {doc.pages} pages · {doc.entities} entities · {doc.relations} relations
-                    · {new Date(doc.ingested_at).toLocaleDateString()}
-                  </div>
-                </div>
-                <div style={{display:'flex', gap:6}}>
-                  <span className="badge">{doc.entities} ent.</span>
-                  <span className="badge green">{doc.relations} rel.</span>
-                </div>
-              </div>
-            ))}
+        <div className="card" style={{ marginTop: 20 }}>
+          <div className="card-head">
+            <span className="card-title">By document</span>
+          </div>
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr><th>Document</th><th className="num">Pages</th><th className="num">Entities</th><th className="num">Relations</th></tr>
+              </thead>
+              <tbody>
+                {docs.map(doc => (
+                  <tr key={doc.sha256}>
+                    <td>
+                      <div className="doc-name">
+                        <span className="doc-icon"><Icon name="file" size={16} /></span>
+                        <span className="doc-title">{doc.filename}</span>
+                      </div>
+                    </td>
+                    <td className="num">{doc.pages}</td>
+                    <td className="num">{doc.entities}</td>
+                    <td className="num">{doc.relations}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
 
-      {docs.length === 0 && !loading && !error && (
-        <div className="card" style={{textAlign:'center', padding:40, color:'var(--text-muted)'}}>
-          No documents ingested yet. Upload a PDF to get started.
+      {!loading && !error && docs.length === 0 && totalNodes === 0 && (
+        <div className="card" style={{ marginTop: 20 }}>
+          <div className="empty">
+            <div className="empty-icon"><Icon name="file" size={22} /></div>
+            <div className="empty-title">The graph is empty</div>
+            <div>Upload a PDF on the Documents page to get started.</div>
+          </div>
         </div>
       )}
     </div>
