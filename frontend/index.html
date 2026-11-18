@@ -2,13 +2,17 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧬</text></svg>" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Medical Graph RAG — Hybrid Knowledge Engine</title>
-    <meta name="description" content="Production-grade Hybrid Graph + Vector RAG for multi-hop medical question answering. Combines Neo4j knowledge graph with Qdrant semantic search." />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='9' fill='%23256abf'/><circle cx='10' cy='11.5' r='3' fill='white'/><circle cx='22' cy='10' r='2.4' fill='white'/><circle cx='15.5' cy='22' r='3.4' fill='white'/></svg>" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Clinical Graph RAG</title>
+    <meta name="description" content="Hybrid graph + vector RAG for multi-hop medical question answering. Combines a Neo4j knowledge graph with Qdrant semantic search, and cites file and page." />
+    <!-- Apply a saved theme before first paint, so there is no flash -->
+    <script>
+      try { var t = localStorage.getItem('theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t } catch (e) {}
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   </head>
   <body>
     <div id="root"></div>
