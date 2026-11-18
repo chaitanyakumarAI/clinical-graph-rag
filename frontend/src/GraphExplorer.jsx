@@ -21,13 +21,24 @@ const LABEL_COLORS = {
   CellType:          '#f0883e',
   MolecularFunction: '#79c0ff',
   BiologicalProcess: '#d2a8ff',
-  Document:          '#484f58',
 }
 
+// Same list as NODE_LABELS in graph/neo4j_client.py
+const LABELS = Object.keys(LABEL_COLORS)
+
+// Node sources are stored as file stems ("diabetes_guide"), documents as
+// filenames ("diabetes_guide.pdf"); compare both in the same form.
+const docKey = s => String(s || '').split(/[\\/]/).pop().replace(/\.pdf$/i, '').toLowerCase()
+
+// Cytoscape refuses to build a graph with a duplicate id or an edge whose
+// endpoint is missing, and then draws nothing — so clean the data first.
 function buildCyElements(nodes, edges) {
-  const els = []
+  const els  = []
+  const seen = new Set()
   nodes.forEach(n => {
-    if (n.name) els.push({
+    if (!n.name || seen.has(n.name)) return
+    seen.add(n.name)
+    els.push({
       data: {
         id: n.name, label: n.name, nodeType: n.label || 'Unknown',
         confidence: n.confidence, stage: n.stage,
@@ -37,7 +48,7 @@ function buildCyElements(nodes, edges) {
     })
   })
   edges.forEach((e, i) => {
-    if (e.source && e.target) els.push({
+    if (seen.has(e.source) && seen.has(e.target)) els.push({
       data: {
         id: `e${i}`, source: e.source, target: e.target,
         label: e.relation, confidence: e.confidence,
@@ -46,6 +57,17 @@ function buildCyElements(nodes, edges) {
     })
   })
   return els
+}
+
+// Explore results carry provenance; subgraph results only add what is missing.
+function mergeGraphs(base, extra) {
+  const names = new Set(base.nodes.map(n => n.name))
+  const edgeKey = e => `${e.source}|${e.relation}|${e.target}`
+  const edges = new Set(base.edges.map(edgeKey))
+  return {
+    nodes: [...base.nodes, ...extra.nodes.filter(n => n.name && !names.has(n.name))],
+    edges: [...base.edges, ...extra.edges.filter(e => !edges.has(edgeKey(e)))],
+  }
 }
 
 function buildCyStyle() {
@@ -65,19 +87,11 @@ function buildCyStyle() {
         'text-wrap': 'truncate',
         'text-max-width': '90px',
         'width': 28, 'height': 28,
-        'background-color': '#388bfd',
+        'background-color': '#6e7681',
         'border-width': 2,
         'border-color': '#30363d',
         'transition-property': 'background-color, border-color, width, height, opacity',
         'transition-duration': '0.15s',
-      }
-    },
-    {
-      selector: 'node:selected',
-      style: {
-        'border-color': '#ffffff',
-        'border-width': 3,
-        'width': 36, 'height': 36,
       }
     },
     {
@@ -89,122 +103,148 @@ function buildCyStyle() {
         'text-rotation': 'autorotate',
         'curve-style': 'bezier',
         'target-arrow-shape': 'triangle',
-        'target-arrow-color': '#30363d',
-        'line-color': '#30363d',
+        'target-arrow-color': '#484f58',
+        'line-color': '#484f58',
         'width': 1.5,
         'arrow-scale': 0.8,
       }
+    },
+    ...nodeStyles,
+    { selector: '.faded', style: { 'opacity': 0.12 } },
+    { selector: 'node.focus', style: { 'border-color': '#e3b341', 'border-width': 4 } },
+    {
+      selector: 'node:selected',
+      style: { 'border-color': '#ffffff', 'border-width': 3, 'width': 36, 'height': 36 }
     },
     {
       selector: 'edge:selected',
       style: { 'line-color': '#388bfd', 'target-arrow-color': '#388bfd', 'width': 2.5 }
     },
-    ...nodeStyles,
   ]
 }
 
-const LABELS = [
-  'Disease', 'Drug', 'Gene', 'Protein', 'Pathway', 'Symptom', 'Treatment',
-  'SideEffect', 'Organ', 'Compound', 'CellType', 'MolecularFunction',
-  'BiologicalProcess', 'Document',
-]
+// Fade everything except the query's entities (and their neighbours) and/or
+// the nodes that came from one document.
+function applyFocus(cy, highlight, docFilter) {
+  cy.elements().removeClass('faded focus')
+  let keep = null
+  const hits = cy.nodes().filter(n => highlight.includes(n.id()))
+  if (hits.length) {
+    hits.addClass('focus')
+    keep = hits.closedNeighborhood()
+  }
+  if (docFilter) {
+    const key = docKey(docFilter)
+    const inDoc = cy.nodes().filter(n => (n.data('sources') || []).some(s => docKey(s) === key))
+    const nodes = keep ? keep.nodes().intersection(inDoc) : inDoc
+    keep = nodes.union(nodes.edgesWith(nodes))
+  }
+  if (keep) cy.elements().not(keep).addClass('faded')
+}
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export function GraphExplorer({ highlightEntities = [], documents = [] }) {
+export function GraphExplorer({ highlightEntities = [], documents = [], onClearHighlight }) {
   const cyRef       = useRef(null)
   const cyInstance  = useRef(null)
+  const layoutRef   = useRef(null)
+  const requestId   = useRef(0)   // only the latest fetch may draw
   const [loading, setLoading]         = useState(false)
+  const [error, setError]             = useState(null)
   const [selectedNode, setSelected]   = useState(null)
   const [labelFilter, setLabelFilter] = useState('')
   const [minConf, setMinConf]         = useState(0)
   const [nodeDetail, setNodeDetail]   = useState(null)
-  // Document source filter
-  const [sourceDoc, setSourceDoc]     = useState('')   // filename to highlight
-  const [allNodes, setAllNodes]       = useState([])   // cached full node list
-  const [allEdges, setAllEdges]       = useState([])
+  const [sourceDoc, setSourceDoc]     = useState('')   // filename to focus on
+  const [graph, setGraph]             = useState({ nodes: [], edges: [] })
+
+  // Read inside cytoscape callbacks, which outlive a single render
+  const focusRef = useRef({ highlight: highlightEntities, doc: sourceDoc })
+  focusRef.current = { highlight: highlightEntities, doc: sourceDoc }
+
+  const highlightKey = highlightEntities.join('\u0000')
 
   const fetchAndRender = useCallback(async () => {
+    const id = ++requestId.current
     setLoading(true)
+    setError(null)
     try {
       const params = new URLSearchParams({ limit: 80, min_conf: minConf })
       if (labelFilter) params.append('label', labelFilter)
       const res  = await fetch(`${API}/graph/explore?${params}`)
       const data = await res.json()
-      const nodes = data.nodes || []
-      const edges = data.edges || []
-      setAllNodes(nodes)
-      setAllEdges(edges)
-      renderGraph(nodes, edges, sourceDoc)
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      let merged = { nodes: data.nodes || [], edges: data.edges || [] }
+
+      // The query's entities may not be in the first 80 nodes: add them
+      const wanted = focusRef.current.highlight
+      if (wanted.length) {
+        const sub = await fetch(`${API}/graph/subgraph?${new URLSearchParams({
+          entities: wanted.join(','), depth: 1 })}`)
+          .then(r => (r.ok ? r.json() : { nodes: [], edges: [] }))
+          .catch(() => ({ nodes: [], edges: [] }))
+        merged = mergeGraphs(merged, { nodes: sub.nodes || [], edges: sub.edges || [] })
+      }
+      if (id !== requestId.current) return   // a newer request is on its way
+      setGraph(merged)
+      renderGraph(merged.nodes, merged.edges)
     } catch (e) {
+      if (id !== requestId.current) return
       console.error('[graph] fetch failed:', e)
+      setError(e.message === 'Failed to fetch'
+        ? 'Cannot reach the API. Is the backend running on port 8000?'
+        : `Could not load the graph: ${e.message}`)
     } finally {
-      setLoading(false)
+      if (id === requestId.current) setLoading(false)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [labelFilter, minConf])
+  }, [labelFilter, minConf, highlightKey])
 
   useEffect(() => { fetchAndRender() }, [fetchAndRender])
 
-  // Re-apply source filter when it changes without a full refetch
+  // Re-apply the document filter without refetching
   useEffect(() => {
-    if (allNodes.length) renderGraph(allNodes, allEdges, sourceDoc)
+    if (cyInstance.current) applyFocus(cyInstance.current, highlightEntities, sourceDoc)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceDoc])
 
-  // Highlight subgraph after a query result
-  useEffect(() => {
-    if (!highlightEntities.length || !cyInstance.current) return
-    const cy = cyInstance.current
-    cy.nodes().style({ opacity: 0.2 })
-    cy.edges().style({ opacity: 0.1 })
-    highlightEntities.forEach(name => {
-      const node = cy.$(`#${CSS.escape(name)}`)
-      if (node.length) {
-        node.style({ opacity: 1 })
-        node.neighborhood().style({ opacity: 0.7 })
-      }
-    })
-  }, [highlightEntities])
+  useEffect(() => () => {
+    requestId.current++
+    destroyGraph()
+  }, [])
 
-  function renderGraph(nodes, edges, docFilter = '') {
+  // Stop the animated layout first: its next frame would touch a destroyed graph
+  function destroyGraph() {
+    layoutRef.current?.stop()
+    cyInstance.current?.destroy()
+    layoutRef.current = null
+    cyInstance.current = null
+  }
+
+  function renderGraph(nodes, edges) {
     if (!cyRef.current) return
-    if (cyInstance.current) cyInstance.current.destroy()
+    destroyGraph()
+    setSelected(null)
+    setNodeDetail(null)
 
     const cy = cytoscape({
       container: cyRef.current,
       elements:  buildCyElements(nodes, edges),
       style:     buildCyStyle(),
-      layout:    { name: 'cose', animate: true, padding: 30,
-                   nodeRepulsion: 4500, gravity: 0.15 },
-      zoom: 1, pan: { x: 0, y: 0 },
       minZoom: 0.3, maxZoom: 4,
     })
-
-    // Apply document source dimming
-    if (docFilter) {
-      cy.nodes().forEach(node => {
-        const sources = node.data('sources') || []
-        const inDoc = Array.isArray(sources)
-          ? sources.some(s => s === docFilter || s?.includes?.(docFilter))
-          : false
-        node.style({ opacity: inDoc ? 1 : 0.12 })
-      })
-      cy.edges().forEach(edge => {
-        const srcOpacity = edge.source().style('opacity')
-        const tgtOpacity = edge.target().style('opacity')
-        edge.style({ opacity: srcOpacity > 0.5 && tgtOpacity > 0.5 ? 0.9 : 0.06 })
-      })
-    }
+    applyFocus(cy, focusRef.current.highlight, focusRef.current.doc)
+    layoutRef.current = cy.layout({ name: 'cose', animate: true, padding: 30,
+                                    nodeRepulsion: 4500, gravity: 0.15 })
+    layoutRef.current.run()
 
     cy.on('tap', 'node', async evt => {
       const node = evt.target
       setSelected({ name: node.data('label'), ...node.data() })
-      // Fetch full provenance from backend
+      setNodeDetail(null)
       try {
         const res  = await fetch(`${API}/graph/node/${encodeURIComponent(node.data('label'))}`)
-        const data = await res.json()
-        setNodeDetail(data)
+        setNodeDetail(res.ok ? await res.json() : null)
       } catch { setNodeDetail(null) }
     })
 
@@ -215,13 +255,17 @@ export function GraphExplorer({ highlightEntities = [], documents = [] }) {
     cyInstance.current = cy
   }
 
-  // Count how many nodes are visible for the selected source doc
-  const visibleCount = sourceDoc
-    ? allNodes.filter(n => {
-        const s = n.sources || []
-        return Array.isArray(s) ? s.some(x => x === sourceDoc || x?.includes?.(sourceDoc)) : false
-      }).length
-    : allNodes.length
+  const nodeCount = new Set(graph.nodes.map(n => n.name).filter(Boolean)).size
+  const docCount  = sourceDoc
+    ? graph.nodes.filter(n => (n.sources || []).some(s => docKey(s) === docKey(sourceDoc))).length
+    : 0
+
+  // Legend: the types actually on screen, most common first
+  const typeCounts = graph.nodes.reduce((acc, n) => {
+    if (n.name && LABEL_COLORS[n.label]) acc[n.label] = (acc[n.label] || 0) + 1
+    return acc
+  }, {})
+  const legend = Object.entries(typeCounts).sort((a, b) => b[1] - a[1])
 
   return (
     <div className="card">
@@ -229,47 +273,69 @@ export function GraphExplorer({ highlightEntities = [], documents = [] }) {
 
       {/* ── Controls row ─────────────────────────────────────────────── */}
       <div className="graph-controls">
-        {/* Entity type filter */}
-        <select className="select-input" value={labelFilter} onChange={e => setLabelFilter(e.target.value)}>
-          <option value="">All Entity Types</option>
+        <select className="select-input" aria-label="Entity type"
+          value={labelFilter} onChange={e => setLabelFilter(e.target.value)}>
+          <option value="">All entity types</option>
           {LABELS.map(l => <option key={l} value={l}>{l}</option>)}
         </select>
 
-        {/* Min confidence slider */}
         <label className="toggle-row">
           Min confidence:
           <input type="range" min="0" max="1" step="0.05" value={minConf}
             onChange={e => setMinConf(parseFloat(e.target.value))}
             style={{ width: 80, accentColor: 'var(--accent-blue)' }} />
-          <span style={{ fontSize: 12 }}>{minConf.toFixed(2)}</span>
+          <span style={{ fontSize: 12, fontVariantNumeric: 'tabular-nums' }}>{minConf.toFixed(2)}</span>
         </label>
 
         <button className="btn btn-secondary btn-sm" onClick={fetchAndRender} disabled={loading}>
           {loading ? <span className="spinner" style={{ width: 12, height: 12 }} /> : '↻'} Refresh
         </button>
 
-        {/* Legend */}
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginLeft: 'auto' }}>
-          {['Disease', 'Drug', 'Gene', 'Protein', 'Pathway'].map(l => (
-            <span key={l} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--text-muted)' }}>
-              <span style={{ width: 10, height: 10, borderRadius: '50%',
-                background: LABEL_COLORS[l], display: 'inline-block' }} />
-              {l}
-            </span>
+        <span className="graph-count">
+          {nodeCount} node{nodeCount !== 1 ? 's' : ''} · {graph.edges.length} edge{graph.edges.length !== 1 ? 's' : ''}
+        </span>
+      </div>
+
+      {legend.length > 0 && (
+        <div className="graph-legend">
+          {legend.map(([l, n]) => (
+            <button key={l} type="button"
+              className={`legend-item ${labelFilter === l ? 'active' : ''}`}
+              title={labelFilter === l ? 'Show all types' : `Show only ${l}`}
+              onClick={() => setLabelFilter(labelFilter === l ? '' : l)}>
+              <span className="legend-dot" style={{ background: LABEL_COLORS[l] }} />
+              {l} <span className="legend-count">{n}</span>
+            </button>
           ))}
         </div>
-      </div>
+      )}
+
+      {/* ── Query highlight banner ───────────────────────────────────── */}
+      {highlightEntities.length > 0 && (
+        <div className="graph-highlight-banner">
+          <span>🔎 Highlighting {highlightEntities.length} entit{highlightEntities.length !== 1 ? 'ies' : 'y'} from your last question:</span>
+          <span className="chip-row">
+            {highlightEntities.slice(0, 6).map(e => <span key={e} className="chip orange">{e}</span>)}
+            {highlightEntities.length > 6 && <span className="chip orange">+{highlightEntities.length - 6}</span>}
+          </span>
+          {onClearHighlight && (
+            <button className="btn btn-secondary btn-sm" style={{ marginLeft: 'auto' }}
+              onClick={onClearHighlight}>✕ Clear</button>
+          )}
+        </div>
+      )}
 
       {/* ── Document Source Filter ────────────────────────────────────── */}
       <div className="graph-doc-filter">
-        <span className="graph-doc-filter-label">📄 Filter by document:</span>
+        <label className="graph-doc-filter-label" htmlFor="graph-doc">📄 Filter by document:</label>
         <select
+          id="graph-doc"
           className="select-input"
           value={sourceDoc}
           onChange={e => setSourceDoc(e.target.value)}
           style={{ minWidth: 200, maxWidth: 320 }}
         >
-          <option value="">Show All Documents</option>
+          <option value="">All documents</option>
           {documents.map(d => (
             <option key={d.sha256} value={d.filename}>{d.filename}</option>
           ))}
@@ -277,12 +343,11 @@ export function GraphExplorer({ highlightEntities = [], documents = [] }) {
         {sourceDoc && (
           <>
             <span className="graph-doc-filter-count">
-              {visibleCount} node{visibleCount !== 1 ? 's' : ''} from this PDF
+              {docCount} node{docCount !== 1 ? 's' : ''} from this PDF
             </span>
-            <button
-              className="btn btn-secondary btn-sm"
-              onClick={() => setSourceDoc('')}
-            >✕ Clear</button>
+            <button className="btn btn-secondary btn-sm" onClick={() => setSourceDoc('')}>
+              ✕ Clear
+            </button>
           </>
         )}
       </div>
@@ -290,6 +355,17 @@ export function GraphExplorer({ highlightEntities = [], documents = [] }) {
       {/* ── Graph canvas + node detail ────────────────────────────────── */}
       <div style={{ position: 'relative' }}>
         <div id="cy-container" ref={cyRef} />
+
+        {!loading && (error || nodeCount === 0) && (
+          <div className="graph-overlay">
+            {error
+              ? <><div style={{ fontSize: 28 }}>⚠️</div><div>{error}</div></>
+              : <><div style={{ fontSize: 28 }}>🕸️</div>
+                  <div>{labelFilter || minConf > 0
+                    ? 'No entities match these filters.'
+                    : 'The graph is empty. Upload a PDF to build it.'}</div></>}
+          </div>
+        )}
 
         {selectedNode && (
           <div className="node-detail-panel">
@@ -315,7 +391,6 @@ export function GraphExplorer({ highlightEntities = [], documents = [] }) {
               </div>
             ))}
 
-            {/* Pages */}
             {selectedNode.pages?.length > 0 && (
               <div className="detail-row">
                 <div className="detail-label">Pages</div>
@@ -327,31 +402,19 @@ export function GraphExplorer({ highlightEntities = [], documents = [] }) {
               </div>
             )}
 
-            {/* Source documents */}
             {selectedNode.sources?.length > 0 && (
               <div style={{ marginTop: 10 }}>
-                <div style={{
-                  fontSize: 10, fontWeight: 600, color: 'var(--text-dim)',
-                  textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: 6,
-                }}>Source Documents</div>
+                <div className="detail-heading">Source documents</div>
                 {selectedNode.sources.map((s, i) => (
-                  <div key={i} style={{
-                    fontSize: 11, padding: '3px 7px', marginBottom: 4,
-                    background: 'var(--bg-input)', borderRadius: 5,
-                    color: 'var(--accent-green)',
-                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                  }} title={s}>📄 {s}</div>
+                  <div key={i} className="detail-source" title={s}>📄 {s}</div>
                 ))}
               </div>
             )}
 
-            {/* Relationships */}
             {nodeDetail?.relationships?.length > 0 && (
               <>
-                <div style={{
+                <div className="detail-heading" style={{
                   borderTop: '1px solid var(--border)', marginTop: 12, paddingTop: 12,
-                  fontSize: 11, fontWeight: 600, color: 'var(--text-muted)',
-                  textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: 8,
                 }}>
                   Relationships ({nodeDetail.relationships.length})
                 </div>
@@ -364,12 +427,11 @@ export function GraphExplorer({ highlightEntities = [], documents = [] }) {
                       <span style={{ color: 'var(--accent-teal)' }}>{r.relation}</span>
                       {' → '}
                       <span style={{ color: 'var(--text-primary)' }}>{r.target}</span>
-                      {r.confidence && (
+                      {r.confidence != null && (
                         <span style={{ color: 'var(--text-dim)', marginLeft: 4 }}>
                           ({r.confidence.toFixed(2)})
                         </span>
                       )}
-                      {/* per-relationship page+source */}
                       {r.pages?.length > 0 && (
                         <span style={{ marginLeft: 6 }}>
                           {r.pages.map(p => (
