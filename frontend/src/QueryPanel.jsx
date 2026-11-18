@@ -1,18 +1,27 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useLayoutEffect } from 'react'
+import { Icon } from './Icon'
 
 // API base — relative so Vite proxy (dev) and FastAPI static (prod) both work
 const API = ''
 
 // Questions the sample PDFs in data/pdfs can answer (from evaluation/testset.json)
 const EXAMPLES = [
-  'Which diabetes drugs interact with blood-pressure medications?',
-  'pt on insulin + metoprolol, why check sugar more often?',
-  'Which drug raises warfarin levels by inhibiting the enzyme that metabolizes it?',
-  'What can cause acute kidney injury in a patient taking lisinopril and hydrochlorothiazide?',
+  { kind: 'Drug interactions', icon: 'pill',
+    q: 'Which diabetes drugs interact with blood-pressure medications?' },
+  { kind: 'Shorthand question', icon: 'heart',
+    q: 'pt on insulin + metoprolol, why check sugar more often?' },
+  { kind: 'Mechanism, two hops', icon: 'flask',
+    q: 'Which drug raises warfarin levels by inhibiting the enzyme that metabolizes it?' },
+  { kind: 'Adverse effects', icon: 'kidney',
+    q: 'What can cause acute kidney injury in a patient taking lisinopril and hydrochlorothiazide?' },
 ]
 
-function RoutePill({ route }) {
-  return <span className={`route-pill ${route}`}>{route.replace('_', ' ')}</span>
+// Planner routes (pipeline/query_planner.py)
+const ROUTE_TEXT = {
+  hybrid_single: 'Graph + text, one hop',
+  hybrid_multi:  'Graph + text, multi-hop',
+  vector_only:   'Text search only',
+  graph_gds:     'Graph algorithms',
 }
 
 // The LLM answers in light Markdown and cites as [file.pdf, p.2] or
@@ -26,7 +35,12 @@ function Inline({ text }) {
     if (part.startsWith('**')) return <strong key={i}>{part.slice(2, -2)}</strong>
     if (part.startsWith('`'))  return <code key={i}>{part.slice(1, -1)}</code>
     if (part.startsWith('*'))  return <em key={i}>{part.slice(1, -1)}</em>
-    return <span key={i} className="cite">{part.slice(1, -1).trim()}</span>
+    const label = part.slice(1, -1).trim().replace(/\.pdf/i, '')
+    return (
+      <span key={i} className="cite" title={part.slice(1, -1).trim()}>
+        <Icon name="file" size={12} strokeWidth={2} />{label}
+      </span>
+    )
   })
 }
 
@@ -62,87 +76,61 @@ function CompletenessNote({ info }) {
   if (!info.repaired) {
     return (
       <div className="completeness ok">
-        ✓ Completeness check: all {parts} part{parts !== 1 ? 's' : ''} of the question answered
+        <Icon name="check" size={15} strokeWidth={2.2} />
+        <span>Completeness check passed: {parts > 1
+          ? `all ${parts} parts of the question are answered.`
+          : 'the question is fully answered.'}</span>
       </div>
     )
   }
   return (
     <div className="completeness repaired">
-      ↻ Completeness check: the first draft missed{' '}
-      <strong>{info.missing.join('; ')}</strong>, so the answer was regenerated
-      {info.added_sources?.length > 0 && <> with {info.added_sources.join(', ')}</>}.
+      <Icon name="refresh" size={15} strokeWidth={2} />
+      <span>
+        The first draft missed <strong>{info.missing.join('; ')}</strong>, so the answer was rewritten
+        {info.added_sources?.length > 0 && <> with extra sources ({info.added_sources.join(', ')})</>}.
+      </span>
     </div>
   )
 }
 
-// ── Citation card — shows actual filename + page number ────────────────────
+const fileName = s => String(s || '').split(/[\\/]/).pop()
 
-function ProvenanceCard({ item }) {
-  const conf = item.confidence || item.score || 0
-
-  // source may be: "path/to/file.pdf", "file.pdf", or an internal ID
-  const rawSource  = item.source || ''
-  const filename   = rawSource.split('/').pop() || rawSource
-  const pageNum    = item.page != null ? item.page : null
-  const isDocument = item.type === 'document'
-  const isGraph    = item.type === 'graph' || item.type === 'graph_gds'
-
+function Source({ item, index }) {
+  const score = item.score ?? item.confidence ?? 0
+  const isDoc = item.type === 'document'
+  const pages = item.page != null ? [item.page] : (item.pages || [])
   return (
-    <div className="prov-card">
-      <div className={`prov-card-type ${item.type}`}>{item.type.replace('_', ' ')}</div>
-
-      <div className="prov-card-citation">
-        {isDocument && (
-          <>
-            <span className="prov-filename" title={rawSource}>
-              📄 {filename || '—'}
-            </span>
-            {pageNum != null && (
-              <span className="prov-page-badge">p.{pageNum}</span>
-            )}
-          </>
+    <div className="source">
+      <span className="source-idx">{index}</span>
+      <div className="source-body">
+        {isDoc ? (
+          <div className="source-title" title={item.source}>
+            <span className="name">{fileName(item.source) || 'Document'}</span>
+          </div>
+        ) : (
+          <div className="source-path" title={item.path}>{item.path || 'Graph fact'}</div>
         )}
-        {isGraph && item.path && (
-          <span className="prov-graph-path" title={item.path}>
-            🕸 {item.path.slice(0, 70)}{item.path.length > 70 ? '…' : ''}
+        {item.text && <div className="source-text">{item.text}</div>}
+        <div className="source-meta">
+          <span className="tag">{isDoc ? 'Text' : item.type === 'graph_gds' ? 'Algorithm' : 'Graph'}</span>
+          {pages.length > 0 && <span>p. {pages.join(', ')}</span>}
+          <span className="meter" title={`score ${score.toFixed(3)}`}>
+            <span style={{ width: `${Math.max(4, Math.min(100, Math.round(score * 100)))}%` }} />
           </span>
-        )}
-        {isGraph && item.pages?.length > 0 && (
-          <span style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 4 }}>
-            {item.pages.map(p => (
-              <span key={p} className="prov-page-badge">p.{p}</span>
-            ))}
-          </span>
-        )}
-      </div>
-
-      {item.text && (
-        <div className="prov-card-text">
-          {item.text.slice(0, 130)}{item.text.length > 130 ? '…' : ''}
+          <span className="num">{score.toFixed(2)}</span>
         </div>
-      )}
-
-      <div className="conf-bar">
-        <div className="conf-bar-fill" style={{ width: `${Math.round(conf * 100)}%` }} />
-      </div>
-      <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 4 }}>
-        score {(item.score || conf).toFixed(3)}
       </div>
     </div>
   )
 }
 
-function Collapsible({ title, children, defaultOpen = false }) {
-  const [open, setOpen] = useState(defaultOpen)
+function Switch({ checked, onChange, label, hint }) {
   return (
-    <div>
-      <button type="button" className="collapsible-header"
-        aria-expanded={open} onClick={() => setOpen(!open)}>
-        <span>{title}</span>
-        <span aria-hidden="true">{open ? '▲' : '▼'}</span>
-      </button>
-      {open && <div style={{ paddingTop: 8 }}>{children}</div>}
-    </div>
+    <label className="switch">
+      <input type="checkbox" role="switch" checked={checked} onChange={e => onChange(e.target.checked)} />
+      <span className="switch-text">{label}<span className="switch-hint">{hint}</span></span>
+    </label>
   )
 }
 
@@ -159,12 +147,73 @@ function useElapsed(running) {
   return seconds
 }
 
+function Details({ result }) {
+  const tabs = [
+    { id: 'search', label: 'Retrieval', icon: 'route' },
+    result.graph_paths?.length      && { id: 'paths',  label: 'Graph paths', icon: 'graph',  count: result.graph_paths.length },
+    result.gds_paths?.length        && { id: 'gds',    label: 'Algorithms',  icon: 'layers', count: result.gds_paths.length },
+    result.generated_cypher?.length && { id: 'cypher', label: 'Cypher',      icon: 'code',   count: result.generated_cypher.length },
+  ].filter(Boolean)
+  const [tab, setTab] = useState('search')
+  const active = tabs.some(t => t.id === tab) ? tab : 'search'
+
+  return (
+    <div className="card">
+      <div className="tabs" role="tablist" aria-label="How the answer was found">
+        {tabs.map(t => (
+          <button key={t.id} type="button" role="tab" className="tab"
+            aria-selected={active === t.id} onClick={() => setTab(t.id)}>
+            <Icon name={t.icon} size={15} />{t.label}
+            {t.count != null && <span className="tab-count">{t.count}</span>}
+          </button>
+        ))}
+      </div>
+      <div className="tab-panel" role="tabpanel">
+        {active === 'search' && (
+          <dl className="kv">
+            <dt>Route</dt>
+            <dd>{ROUTE_TEXT[result.route] || result.route}{result.route_reason && <span className="muted"> · {result.route_reason}</span>}</dd>
+            {result.retrieval_strategy && <><dt>Strategy</dt><dd>{result.retrieval_strategy}</dd></>}
+            {result.rewritten_query && result.rewritten_query !== result.question && (
+              <><dt>Searched as</dt><dd>{result.rewritten_query}</dd></>
+            )}
+            {result.sub_queries?.length > 0 && (
+              <><dt>Sub-questions</dt>
+                <dd><ol style={{ paddingLeft: 18 }}>{result.sub_queries.map((q, i) => <li key={i}>{q}</li>)}</ol></dd></>
+            )}
+            {result.vector_sources?.length > 0 && (
+              <><dt>Passages read</dt>
+                <dd className="chip-row">
+                  {[...new Set(result.vector_sources)].map(s => {
+                    const m = s.match(/^(.*?)\s+p\.(\d+)$/)
+                    return <span key={s} className="chip">{fileName(m ? m[1] : s).replace(/\.pdf$/i, '')}{m && <span className="muted">p.{m[2]}</span>}</span>
+                  })}
+                </dd></>
+            )}
+            <dt>Planner confidence</dt><dd className="num">{Math.round((result.planner_confidence || 0) * 100)}%</dd>
+          </dl>
+        )}
+        {active === 'paths' && (
+          <div className="path-list">{result.graph_paths.map((p, i) => <div key={i} className="path-line">{p}</div>)}</div>
+        )}
+        {active === 'gds' && (
+          <div className="path-list">{result.gds_paths.map((p, i) => <div key={i} className="path-line">{p}</div>)}</div>
+        )}
+        {active === 'cypher' && result.generated_cypher.map((q, i) => <pre key={i} className="code-block">{q}</pre>)}
+      </div>
+    </div>
+  )
+}
+
 export function QueryPanel({ onQueryResult, onShowInGraph, backendDown = false }) {
   const [question, setQuestion]     = useState('')
+  const [asked, setAsked]           = useState('')
   const [loading, setLoading]       = useState(false)
   const [result, setResult]         = useState(null)
   const [error, setError]           = useState(null)
   const [copied, setCopied]         = useState(false)
+  const [showOptions, setShowOptions] = useState(false)
+  const [allEntities, setAllEntities] = useState(false)
   const [useLLMCypher, setLLMCypher] = useState(false)
   const [useGDS, setUseGDS]         = useState(false)
   const [useRewrite, setUseRewrite] = useState(true)
@@ -172,9 +221,25 @@ export function QueryPanel({ onQueryResult, onShowInGraph, backendDown = false }
   const inputRef = useRef(null)
   const elapsed  = useElapsed(loading)
 
+  // Grow the box with the question (up to 240px); refit when its width changes
+  useLayoutEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    const fit = () => {
+      if (!el.clientWidth) return   // hidden page: measure when shown
+      el.style.height = 'auto'
+      el.style.height = `${Math.min(el.scrollHeight, 240)}px`
+    }
+    fit()
+    const ro = new ResizeObserver(fit)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [question])
+
   const handleQuery = async (text = question) => {
     if (!text.trim() || loading) return
     setLoading(true)
+    setAsked(text.trim())
     setError(null)
     setResult(null)
     setCopied(false)
@@ -201,16 +266,13 @@ export function QueryPanel({ onQueryResult, onShowInGraph, backendDown = false }
       setResult(data)
       onQueryResult?.(data)
     } catch {
-      setError('Failed to connect to API. Is the backend running on port 8000?')
+      setError('Could not reach the API. Is the backend running on port 8000?')
     } finally {
       setLoading(false)
     }
   }
 
-  const askExample = q => {
-    setQuestion(q)
-    handleQuery(q)
-  }
+  const askExample = q => { setQuestion(q); handleQuery(q) }
 
   const handleKey = e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleQuery() }
@@ -224,198 +286,209 @@ export function QueryPanel({ onQueryResult, onShowInGraph, backendDown = false }
     } catch { /* clipboard blocked: nothing to do */ }
   }
 
+  const reset = () => {
+    setResult(null); setError(null); setQuestion(''); setAsked('')
+    inputRef.current?.focus()
+  }
+
+  const started  = loading || result || error
+  const optionsOn = [useRewrite, useCompleteness, useLLMCypher, useGDS].filter(Boolean).length
+  const entities = [...new Set(result?.linked_entities || [])]
+
   return (
-    <div className="card">
-      <div className="card-title">🔬 Ask a Medical Question</div>
-
-      <div className="query-input-row">
-        <textarea
-          ref={inputRef}
-          className="query-input"
-          rows={2}
-          aria-label="Medical question"
-          placeholder="Which drugs for Type 2 Diabetes interact with hypertension medications?"
-          value={question}
-          onChange={e => setQuestion(e.target.value)}
-          onKeyDown={handleKey}
-        />
-        <button className="btn btn-primary" onClick={() => handleQuery()}
-          disabled={!question.trim() || loading}
-          style={{ alignSelf: 'flex-start', minWidth: 100 }}>
-          {loading ? <><span className="spinner" /> {elapsed}s</> : '🚀 Ask'}
-        </button>
-      </div>
-      <div className="input-hint">Enter to ask · Shift+Enter for a new line</div>
-
-      <div className="query-options">
-        <label className="toggle-row" title="Fix typos, expand abbreviations and split multi-part questions before searching">
-          <input type="checkbox" checked={useRewrite} onChange={e => setUseRewrite(e.target.checked)} />
-          Query rewriting
-        </label>
-        <label className="toggle-row" title="For multi-part questions: check every part was answered and regenerate once if not (one extra LLM call)">
-          <input type="checkbox" checked={useCompleteness} onChange={e => setUseCompleteness(e.target.checked)} />
-          Completeness check
-        </label>
-        <label className="toggle-row" title="Let the LLM write a read-only Cypher query for the graph">
-          <input type="checkbox" checked={useLLMCypher} onChange={e => setLLMCypher(e.target.checked)} />
-          LLM-written Cypher
-        </label>
-        <label className="toggle-row" title="PageRank / shortest-path context; needs the Neo4j Graph Data Science plugin">
-          <input type="checkbox" checked={useGDS} onChange={e => setUseGDS(e.target.checked)} />
-          Graph algorithms (GDS)
-        </label>
-      </div>
-
-      {!result && !loading && (
-        <div className="examples">
-          <div className="examples-label">Try an example</div>
-          <div className="examples-row">
-            {EXAMPLES.map(q => (
-              <button key={q} type="button" className="example-chip"
-                onClick={() => askExample(q)} disabled={backendDown}>
-                {q}
-              </button>
-            ))}
+    <div className={`ask ${started ? 'has-result' : ''}`}>
+      {!started && (
+        <div className="ask-hero">
+          <span className="ask-eyebrow"><Icon name="sparkle" size={14} />Knowledge graph + semantic search</span>
+          <h1 className="ask-title">Ask a clinical question</h1>
+          <p className="ask-sub">
+            Answers combine facts from the Neo4j graph with passages from your PDFs,
+            and cite the file and page they came from.
+          </p>
+        </div>
+      )}
+      {started && (
+        <div className="page-header" style={{ marginBottom: 16 }}>
+          <div>
+            <h1 className="page-title">Ask</h1>
+          </div>
+          <div className="page-actions">
+            <button type="button" className="btn btn-secondary" onClick={reset} disabled={loading}>
+              <Icon name="plus" size={16} />New question
+            </button>
           </div>
         </div>
       )}
 
-      {loading && (
-        <>
-          <div className="progress-bar"><div className="progress-bar-fill" /></div>
-          <div className="input-hint" role="status">
-            Rewriting, searching Qdrant and Neo4j, then writing a cited answer…
+      <div style={{ maxWidth: started ? 'none' : 760, margin: '0 auto' }}>
+        <div className="composer">
+          <label htmlFor="question" className="sr-only">Medical question</label>
+          <textarea
+            id="question"
+            ref={inputRef}
+            rows={1}
+            placeholder="e.g. Which diabetes drugs interact with blood-pressure medications?"
+            value={question}
+            onChange={e => setQuestion(e.target.value)}
+            onKeyDown={handleKey}
+          />
+          <div className="composer-bar">
+            <button type="button" className="options-toggle" aria-expanded={showOptions}
+              aria-controls="ask-options" onClick={() => setShowOptions(o => !o)}>
+              <Icon name="filter" size={14} />Options
+              <span className="muted num">{optionsOn}/4</span>
+              <Icon name="chevron" size={14} className="chev" />
+            </button>
+            <span className="composer-hint">Enter to ask · Shift+Enter for a new line</span>
+            <button type="button" className="send-btn" onClick={() => handleQuery()}
+              disabled={!question.trim() || loading} aria-label={loading ? 'Answering' : 'Ask'}>
+              {loading
+                ? <><span className="spinner" style={{ width: 14, height: 14 }} /><span className="num">{elapsed}s</span></>
+                : <Icon name="send" size={18} strokeWidth={2.2} />}
+            </button>
           </div>
-        </>
+          {showOptions && (
+            <div className="options-panel" id="ask-options">
+              <Switch checked={useRewrite} onChange={setUseRewrite} label="Query rewriting"
+                hint="Fix typos, expand abbreviations, split multi-part questions" />
+              <Switch checked={useCompleteness} onChange={setUseCompleteness} label="Completeness check"
+                hint="Re-answer once if a part was missed (one extra LLM call)" />
+              <Switch checked={useLLMCypher} onChange={setLLMCypher} label="LLM-written Cypher"
+                hint="Let the model write a read-only graph query" />
+              <Switch checked={useGDS} onChange={setUseGDS} label="Graph algorithms"
+                hint="PageRank and shortest paths; needs Neo4j GDS" />
+            </div>
+          )}
+        </div>
+
+        {!started && (
+          <>
+            <div className="examples">
+              <div className="section-label">Try one of these</div>
+              <div className="examples-grid">
+                {EXAMPLES.map(ex => (
+                  <button key={ex.q} type="button" className="example"
+                    onClick={() => askExample(ex.q)} disabled={backendDown}>
+                    <span className="example-icon"><Icon name={ex.icon} size={17} /></span>
+                    <span>
+                      <span className="example-kind" style={{ display: 'block' }}>{ex.kind}</span>
+                      <span className="example-q">{ex.q}</span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="ask-capabilities">
+              <span><Icon name="database" size={15} />Qdrant semantic search</span>
+              <span><Icon name="graph" size={15} />Neo4j knowledge graph</span>
+              <span><Icon name="file" size={15} />Answers cite file and page</span>
+            </div>
+          </>
+        )}
+      </div>
+
+      {error && (
+        <div className="alert error" role="alert" style={{ marginTop: 20 }}>
+          <Icon name="alert" size={17} />
+          <div className="alert-body"><strong>No answer.</strong> {error}</div>
+          <button type="button" className="btn btn-secondary btn-sm" onClick={() => handleQuery(asked)}>
+            <Icon name="refresh" size={14} />Retry
+          </button>
+        </div>
       )}
 
-      {error && <div className="alert error" role="alert">⚠️ {error}</div>}
+      {loading && (
+        <div className="result-grid">
+          <div className="result-main">
+            <div className="card">
+              <div className="working" role="status">
+                <span className="spinner" />
+                <span>Working on it… <span className="num muted">{elapsed}s</span></span>
+                <span className="working-steps">
+                  <span>Rewrite</span><span>Search text</span><span>Walk graph</span><span>Write answer</span>
+                </span>
+              </div>
+              <div className="answer-skeleton" aria-hidden="true">
+                <div className="skeleton" style={{ width: '92%' }} />
+                <div className="skeleton" style={{ width: '86%' }} />
+                <div className="skeleton" style={{ width: '64%' }} />
+                <div className="skeleton" style={{ width: '88%', marginTop: 10 }} />
+                <div className="skeleton" style={{ width: '72%' }} />
+              </div>
+            </div>
+            <p className="muted" style={{ fontSize: 13 }}>
+              Free-tier rate limits can make this take a minute or two.
+            </p>
+          </div>
+          <div className="result-rail">
+            <div className="card card-pad answer-skeleton" aria-hidden="true">
+              <div className="skeleton" style={{ width: '40%' }} />
+              <div className="skeleton" style={{ width: '90%' }} />
+              <div className="skeleton" style={{ width: '75%' }} />
+            </div>
+          </div>
+        </div>
+      )}
 
       {result && (
-        <div style={{ marginTop: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
-
-          {/* Route + strategy + latency */}
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-            <RoutePill route={result.route} />
-            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              {result.route_reason}
-            </span>
-            {result.retrieval_strategy && (
-              <span style={{ fontSize: 11, color: 'var(--text-dim)', fontStyle: 'italic' }}>
-                — {result.retrieval_strategy}
-              </span>
-            )}
-            <span className="badge" style={{ marginLeft: 'auto' }}
-              title="How sure the planner was about the route">
-              planner {Math.round((result.planner_confidence || 0) * 100)}%
-            </span>
-            <span className="badge">{(result.latency_ms / 1000).toFixed(1)}s</span>
-          </div>
-
-          {/* What retrieval searched for, when it differs from the typed question */}
-          {(result.rewritten_query !== result.question || result.sub_queries?.length > 0) && (
-            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              🔁 Searched as: <em>{result.rewritten_query}</em>
-              {result.sub_queries?.length > 0 && (
-                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
-                  {result.sub_queries.map((q, i) => <span key={i} className="chip">{q}</span>)}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Answer */}
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
-              <div className="card-title" style={{ margin: 0 }}>Answer</div>
-              <button type="button" className="btn btn-secondary btn-sm"
-                style={{ marginLeft: 'auto' }} onClick={copyAnswer}>
-                {copied ? '✓ Copied' : '⧉ Copy'}
-              </button>
-            </div>
-            <div className="answer-box"><AnswerText text={result.answer} /></div>
-            <CompletenessNote info={result.completeness} />
-          </div>
-
-          {/* Linked entities */}
-          {result.linked_entities?.length > 0 && (
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
-                <div className="card-title" style={{ margin: 0 }}>Linked Graph Entities</div>
-                {onShowInGraph && (
-                  <button type="button" className="btn btn-secondary btn-sm"
-                    style={{ marginLeft: 'auto' }} onClick={onShowInGraph}>
-                    🕸️ Show in graph
+        <div className="result-grid">
+          <div className="result-main">
+            <article className="card answer-card">
+              <div className="card-head">
+                <span className="card-title">Answer</span>
+                <div className="answer-meta">
+                  <span className="tag accent">{ROUTE_TEXT[result.route] || result.route}</span>
+                  <span className="tag" title="Time to answer"><Icon name="clock" size={13} />{(result.latency_ms / 1000).toFixed(1)}s</span>
+                  <button type="button" className="btn btn-ghost btn-sm" onClick={copyAnswer}>
+                    <Icon name={copied ? 'check' : 'copy'} size={14} />{copied ? 'Copied' : 'Copy'}
                   </button>
-                )}
+                </div>
               </div>
-              <div className="chip-row">
-                {[...new Set(result.linked_entities)].map(e => <span key={e} className="chip">{e}</span>)}
+              <div className="answer-body"><AnswerText text={result.answer} /></div>
+              {result.completeness && (
+                <div className="answer-foot"><CompletenessNote info={result.completeness} /></div>
+              )}
+            </article>
+            <Details result={result} />
+          </div>
+
+          <aside className="result-rail">
+            {result.provenance?.length > 0 && (
+              <div className="card">
+                <div className="card-head">
+                  <span className="card-title">Sources</span>
+                  <span className="card-sub num" style={{ marginLeft: 'auto' }}>{result.provenance.length}</span>
+                </div>
+                <div className="source-list">
+                  {result.provenance.map((p, i) => <Source key={i} item={p} index={i + 1} />)}
+                </div>
               </div>
-            </div>
-          )}
-
-          {result.provenance?.length > 0 && (
-            <Collapsible title={`📎 Provenance & Citations (${result.provenance.length})`} defaultOpen>
-              <div className="provenance-grid">
-                {result.provenance.map((p, i) => <ProvenanceCard key={i} item={p} />)}
+            )}
+            {entities.length > 0 && (
+              <div className="card entity-card">
+                <div className="card-head">
+                  <span className="card-title">Graph entities</span>
+                  <span className="card-sub num" style={{ marginLeft: 'auto' }}>{entities.length}</span>
+                </div>
+                <div className="card-pad">
+                  <div className="chip-row">
+                    {(allEntities ? entities : entities.slice(0, 12)).map(e => <span key={e} className="chip">{e}</span>)}
+                    {entities.length > 12 && (
+                      <button type="button" className="chip" style={{ cursor: 'pointer' }}
+                        onClick={() => setAllEntities(a => !a)}>
+                        {allEntities ? 'Show fewer' : `+${entities.length - 12} more`}
+                      </button>
+                    )}
+                  </div>
+                  {onShowInGraph && (
+                    <button type="button" className="btn btn-secondary" onClick={onShowInGraph}>
+                      <Icon name="graph" size={16} />Show in graph
+                    </button>
+                  )}
+                </div>
               </div>
-            </Collapsible>
-          )}
-
-          {result.vector_sources?.length > 0 && (
-            <Collapsible title={`📚 Document Sources (${result.vector_sources.length})`}>
-              <div className="chip-row">
-                {result.vector_sources.map((s, i) => {
-                  // s = "some/path/file.pdf p.3"  — parse it
-                  const match = s.match(/^(.*?)\s+p\.(\d+)$/)
-                  const fname = match
-                    ? match[1].split('/').pop()
-                    : s.split('/').pop()
-                  const page  = match ? match[2] : null
-                  return (
-                    <span key={i} className="source-chip">
-                      <span className="source-chip-name">📄 {fname}</span>
-                      {page && <span className="source-chip-page">p.{page}</span>}
-                    </span>
-                  )
-                })}
-              </div>
-            </Collapsible>
-          )}
-
-          {result.graph_paths?.length > 0 && (
-            <Collapsible title={`🕸️ Graph Paths (${result.graph_paths.length})`}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                {result.graph_paths.map((p, i) => (
-                  <div key={i} className="path-line teal">{p}</div>
-                ))}
-              </div>
-            </Collapsible>
-          )}
-
-          {result.gds_paths?.length > 0 && (
-            <Collapsible title={`🧮 GDS Algorithm Context (${result.gds_paths.length})`}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                {result.gds_paths.map((p, i) => (
-                  <div key={i} className="path-line purple">{p}</div>
-                ))}
-              </div>
-            </Collapsible>
-          )}
-
-          {result.generated_cypher?.length > 0 && (
-            <Collapsible title={`⚡ Generated Cypher (${result.generated_cypher.length} queries)`}>
-              {result.generated_cypher.map((q, i) => (
-                <div key={i} className="cypher-block">{q}</div>
-              ))}
-            </Collapsible>
-          )}
-
-          <button type="button" className="btn btn-secondary btn-sm" style={{ alignSelf: 'flex-start' }}
-            onClick={() => { setResult(null); setQuestion(''); inputRef.current?.focus() }}>
-            ＋ New question
-          </button>
+            )}
+          </aside>
         </div>
       )}
     </div>
