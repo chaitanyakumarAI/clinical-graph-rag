@@ -230,7 +230,9 @@ export function UploadPanel({ onSuccess, onDocumentsChange }) {
     e.preventDefault()
     setDragging(false)
     const f = e.dataTransfer.files[0]
-    if (f?.name.endsWith('.pdf')) setFile(f)
+    if (!f) return
+    if (f.name.toLowerCase().endsWith('.pdf')) { setFile(f); setError(null); setResult(null) }
+    else setError(`"${f.name}" is not a PDF.`)
   }, [])
 
   const handleIngest = async () => {
@@ -279,6 +281,12 @@ export function UploadPanel({ onSuccess, onDocumentsChange }) {
           onDragLeave={() => setDragging(false)}
           onDrop={handleDrop}
           onClick={() => inputRef.current.click()}
+          onKeyDown={e => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); inputRef.current.click() }
+          }}
+          role="button"
+          tabIndex={0}
+          aria-label={file ? `Selected ${file.name}. Choose a different PDF` : 'Choose a PDF to upload'}
         >
           <div className="drop-zone-icon">{file ? '📋' : '☁️'}</div>
           <div className="drop-zone-text">
@@ -288,7 +296,7 @@ export function UploadPanel({ onSuccess, onDocumentsChange }) {
             }
           </div>
           <input ref={inputRef} type="file" accept=".pdf" style={{ display: 'none' }}
-            onChange={e => setFile(e.target.files[0])} />
+            onChange={e => { if (e.target.files[0]) { setFile(e.target.files[0]); setError(null); setResult(null) } }} />
         </div>
 
         <div className="ingest-options">

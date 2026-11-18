@@ -31,19 +31,28 @@ export function StatsDashboard() {
   const [docs, setDocs]         = useState([])
   const [health, setHealth]     = useState(null)
   const [loading, setLoading]   = useState(true)
+  const [error, setError]       = useState(null)
+  const [reload, setReload]     = useState(0)
 
   useEffect(() => {
-    Promise.all([
-      fetch(`${API}/graph/stats`).then(r => r.json()),
-      fetch(`${API}/documents`).then(r => r.json()),
-      fetch(`${API}/health`).then(r => r.json()),
-    ]).then(([s, d, h]) => {
-      setStats(s)
-      setDocs(d.documents || [])
-      setHealth(h)
-    }).catch(console.error)
+    const getJson = url => fetch(`${API}${url}`).then(r => {
+      if (!r.ok) throw new Error(`${url} returned HTTP ${r.status}`)
+      return r.json()
+    })
+    setLoading(true)
+    setError(null)
+    // allSettled: one failing endpoint should not blank the whole page
+    Promise.allSettled([getJson('/graph/stats'), getJson('/documents'), getJson('/health')])
+      .then(([s, d, h]) => {
+        setStats(s.status === 'fulfilled' ? s.value : null)
+        setDocs(d.status === 'fulfilled' ? d.value.documents || [] : [])
+        setHealth(h.status === 'fulfilled' ? h.value : null)
+        const failed = [s, d, h].filter(r => r.status === 'rejected')
+        if (failed.length === 3) setError('Cannot reach the API. Is the backend running on port 8000?')
+        else if (failed.length) setError(`Some data could not be loaded: ${failed.map(f => f.reason.message).join('; ')}`)
+      })
       .finally(() => setLoading(false))
-  }, [])
+  }, [reload])
 
   if (loading) return (
     <div className="card" style={{textAlign:'center', padding:60}}>
@@ -59,8 +68,19 @@ export function StatsDashboard() {
   const totalNodes = nodeData.reduce((s,d) => s + d.count, 0)
   const totalEdges = edgeData.reduce((s,d) => s + d.count, 0)
 
+  const apiStatus = !health ? '❌ Offline'
+    : health.status === 'ok' ? '✅ Online' : '⚠️ Degraded'
+
   return (
     <div style={{display:'flex', flexDirection:'column', gap:20}}>
+
+      {error && (
+        <div className="alert error" role="alert" style={{marginTop:0, display:'flex', alignItems:'center', gap:12}}>
+          <span>⚠️ {error}</span>
+          <button className="btn btn-secondary btn-sm" style={{marginLeft:'auto'}}
+            onClick={() => setReload(n => n + 1)}>↻ Retry</button>
+        </div>
+      )}
 
       {/* Top stats */}
       <div className="stats-grid" style={{gridTemplateColumns:'repeat(4,1fr)'}}>
@@ -68,7 +88,7 @@ export function StatsDashboard() {
           ['Total Nodes', totalNodes.toLocaleString()],
           ['Total Edges', totalEdges.toLocaleString()],
           ['Documents',   docs.length],
-          ['API Status',  health?.status === 'ok' ? '✅ Online' : '⚠️ Degraded'],
+          ['API Status',  apiStatus],
         ].map(([label, val]) => (
           <div key={label} className="stat-card">
             <div className="stat-value" style={{fontSize:20}}>{val}</div>
@@ -143,7 +163,7 @@ export function StatsDashboard() {
         </div>
       )}
 
-      {docs.length === 0 && !loading && (
+      {docs.length === 0 && !loading && !error && (
         <div className="card" style={{textAlign:'center', padding:40, color:'var(--text-muted)'}}>
           No documents ingested yet. Upload a PDF to get started.
         </div>
