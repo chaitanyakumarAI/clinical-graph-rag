@@ -475,3 +475,8 @@ ingestion, rewrite on, check off → on, same judges):
 | RAGAS runner targets configs / subsets | `evaluation/run_ragas.py`, `evaluation/compare.py` | Measure only what changed; keep the original results untouched |
 | One Document per PDF in the CLI | `run_stage1.py` | `--pdf-dir` cited facts from every PDF as the first PDF |
 | Measured completeness check, README | `evaluation/results/fork/`, `README.md`, this file | Before/after numbers (§8) |
+| Only drawable edges from `/graph/explore` | `backend/main.py`, `tests/test_graph_explore_api.py` | Dangling edges made Cytoscape draw nothing |
+| Graph Explorer fixes | `frontend/src/GraphExplorer.jsx` | Highlight after a query, document filter (`.pdf` mismatch), fetch races |
+| UI: state across tabs, phone nav, status | `frontend/src/App.jsx`, `index.css` | No nav below 768px; answers lost on tab switch |
+| Query panel: rendered answers, completeness | `frontend/src/QueryPanel.jsx` | Raw Markdown; completeness result was returned but never shown |
+| Dashboard errors, drop zone a11y | `frontend/src/StatsDashboard.jsx`, `UploadPanel.jsx` | "0 nodes" shown when the backend was down |

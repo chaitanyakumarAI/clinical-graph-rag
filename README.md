@@ -196,7 +196,7 @@ the name of the store and the setting to check.
 
 ```bash
 pip install -r requirements-dev.txt     # light: no torch or models needed
-pytest                                   # 118 unit/API tests, a few seconds, no LLM or database calls
+pytest                                   # 122 unit/API tests, a few seconds, no LLM or database calls
 ```
 
 The LLM is replaced by a fake that returns canned JSON, and the API tests run the real
@@ -249,7 +249,7 @@ focused commits. Design details and trade-offs are in
 
 | Change | Before | After |
 |---|---|---|
-| **Tests + CI** | `pytest` collected 0 tests; no CI | 119 tests (fake LLM, API tests, fake-clock rate limiter, live Neo4j test); GitHub Actions runs them, lints and builds the frontend, and builds the Docker images |
+| **Tests + CI** | `pytest` collected 0 tests; no CI | 123 tests (fake LLM, API tests, fake-clock rate limiter, live Neo4j test); GitHub Actions runs them, lints and builds the frontend, and builds the Docker images |
 | **Provenance across documents** (bug) | Ingesting a second PDF **overwrote** `sources` / `chunk_ids` / `pages` on shared nodes and edges; confidence drifted towards the latest PDF | Lists are unioned (plain Cypher, no APOC); confidence is the max; deleting a document removes only its provenance and Evidence |
 | **One Document per PDF in the CLI** (bug) | `run_stage1.py --pdf-dir` put all chunks under one Document named after the first PDF, so facts from the other PDFs were **cited as the wrong file** | Each PDF gets its own Document (sha256 + filename) like `POST /ingest`; already-ingested PDFs are skipped |
 | **Sub-query cleaning** (bug) | One non-string sub-query from the LLM failed validation and discarded the whole rewrite | Bad items are dropped, the rest are kept |
@@ -258,6 +258,8 @@ focused commits. Design details and trade-offs are in
 | **Extraction cache key** | Key was the chunk text only, so changing the model or prompt silently reused old extractions | Key includes a fingerprint of model, prompts, types, ontology and thresholds. Caches from the original code are re-extracted once |
 | **Docker Compose** | Manual Neo4j / Qdrant / Python / Node setup | `docker compose up --build` (CPU-only torch, nginx-served UI, persistent volumes) |
 | **Answer completeness check** | Multi-hop answers dropped parts of the question even though context recall was 1.0 | After the draft, an LLM check lists the question's parts; for up to 2 missing parts it retrieves more and regenerates once. +1 LLM call (+2 when repairing). Measured: detects the gap, no measurable gain yet (below) |
+| **Graph Explorer** (bug) | Drew **nothing**: `/graph/explore` returned edges to nodes outside the page (125 of 240), and Cytoscape refuses a graph with a dangling edge. The query highlight never applied and the document filter matched 0 nodes | Only drawable edges are returned (neighbours added for a type filter); highlight and document filter work; legend with counts, empty/error states |
+| **UI** | Below 768px there was no navigation at all; switching pages lost the answer and any upload in progress; answers shown as raw Markdown; dashboard showed "0 nodes" when the backend was down | Tab bar on phones, keyboard-accessible controls, live backend status, rendered answers with highlighted citations, completeness result and example questions, clear error states |
 
 ### Measured effect of the completeness check
 
