@@ -36,7 +36,7 @@ body {
 .app-shell {
   display: grid;
   grid-template-rows: 60px 1fr;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 220px minmax(0, 1fr);
   grid-template-areas:
     "header header"
     "sidebar main";
@@ -91,13 +91,18 @@ body {
 }
 .nav-item {
   display: flex; align-items: center; gap: 10px;
+  width: 100%;
   padding: 10px 20px;
   cursor: pointer;
-  border-radius: 0;
-  font-size: 13px;
-  color: var(--text-muted);
-  transition: all 0.15s;
+  border: none;
   border-left: 3px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  color: var(--text-muted);
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 .nav-item:hover { background: rgba(255,255,255,0.04); color: var(--text-primary); }
 .nav-item.active {
@@ -398,13 +403,43 @@ body {
 ::-webkit-scrollbar-thumb:hover { background: #484f58; }
 
 /* ── Responsive ──────────────────────────────────────────────────────────── */
+/* Narrow screens: the sidebar becomes a scrollable tab bar under the header
+   (it used to be hidden, which left no way to change page). */
 @media (max-width: 768px) {
   .app-shell {
-    grid-template-columns: 1fr;
-    grid-template-areas: "header" "main";
+    grid-template-rows: auto auto 1fr;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "header" "sidebar" "main";
   }
-  .sidebar { display: none; }
+  .header { padding: 10px 16px; height: auto; position: static; }
+  .header-title { font-size: 15px; }
+  .hide-narrow { display: none; }
+  .sidebar {
+    flex-direction: row;
+    overflow-x: auto;
+    padding: 0 8px;
+    gap: 0;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 90;
+  }
+  .nav-item {
+    width: auto; flex: 0 0 auto;
+    padding: 12px 12px;
+    border-left: none;
+    border-bottom: 2px solid transparent;
+    white-space: nowrap;
+  }
+  .nav-item.active { border-bottom-color: var(--accent-blue); }
+  .nav-docs, .sidebar-footer { display: none; }
   .main-content { padding: 16px; }
+  .card { padding: 16px; }
+  .query-input-row { flex-direction: column; }
+  .query-input-row .btn { align-self: stretch !important; justify-content: center; }
+  .stats-grid { grid-template-columns: repeat(2, 1fr) !important; }
+  #cy-container { height: 420px; }
+  .node-detail-panel { width: 100%; border-left: none; border-radius: var(--radius-md); }
+  .graph-count { margin-left: 0; }
 }
 
 /* ── Document Registry Table ─────────────────────────────────────────────── */
@@ -649,4 +684,44 @@ body {
   background: var(--bg-input); border-radius: 5px;
   color: var(--accent-green);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ── App shell: live status, sidebar footer, keyboard focus ─────────────── */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 600;
+  padding: 3px 10px; border-radius: 20px;
+  color: var(--text-muted);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); }
+.status-pill.ok       { color: var(--accent-green); border-color: rgba(63,185,80,0.3); }
+.status-pill.ok .status-dot { background: var(--accent-green); box-shadow: 0 0 6px var(--accent-green); }
+.status-pill.degraded { color: var(--accent-orange); border-color: rgba(210,153,34,0.35); }
+.status-pill.degraded .status-dot { background: var(--accent-orange); }
+.status-pill.offline  { color: var(--accent-red); border-color: rgba(248,81,73,0.35); }
+.status-pill.offline .status-dot { background: var(--accent-red); }
+
+.sidebar-footer {
+  margin-top: auto;
+  padding: 16px 20px;
+  border-top: 1px solid var(--border);
+  font-size: 11px; line-height: 1.8;
+  color: var(--text-dim);
+}
+.nav-docs { margin-top: 4px; }
+
+:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+.nav-item:focus-visible { outline-offset: -2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }
