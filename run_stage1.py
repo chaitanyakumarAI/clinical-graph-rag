@@ -20,18 +20,20 @@ import json
 import sys
 import os
 import time
+from pathlib import Path
 
 # Make imports work from project root
 sys.path.insert(0, os.path.dirname(__file__))
 
 import openai
 
-from ingestion.pdf_parser    import parse_pdf, parse_pdf_directory
+from ingestion.pdf_parser    import parse_pdf
 from ingestion.chunker       import chunk_pages
 from ingestion.entity_extractor import extract_from_chunks
 from ingestion.deduplicator  import deduplicate
 from graph.neo4j_client      import Neo4jClient
 from graph.graph_loader      import load_to_graph, load_chunks_to_qdrant
+from graph.document_registry import compute_sha256, is_already_ingested, register_document
 from llm                     import RateLimitExhausted, model_for, resolve_provider
 
 
@@ -74,6 +76,27 @@ def parse_args():
     return parser.parse_args()
 
 
+def _pdf_paths(args) -> list[Path]:
+    if args.pdf:
+        return [Path(args.pdf)]
+    paths = sorted(Path(args.pdf_dir).glob("*.pdf"))
+    if not paths:
+        print(f"❌ No PDFs found in: {args.pdf_dir}")
+        sys.exit(1)
+    return paths
+
+
+def _already_ingested(docs: list[dict]) -> set[str]:
+    """sha256 of the docs already in Neo4j (same check as POST /ingest)."""
+    try:
+        with Neo4jClient() as neo4j:
+            return {d["sha256"] for d in docs if is_already_ingested(d["sha256"], neo4j)}
+    except Exception as e:
+        print(f"\n❌ Neo4j error: {e}")
+        print("   Is Neo4j running? Check NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD in .env")
+        sys.exit(1)
+
+
 def main():
     args = parse_args()
     start = time.time()
@@ -82,30 +105,48 @@ def main():
     print("  Stage 1: Base Graph — PDF → Neo4j")
     print("=" * 65)
 
-    # ── Step 1: Parse ──────────────────────────────────────────────────────
-    print("\n[1/5] Parsing PDF(s) …")
-    if args.pdf:
-        pages = parse_pdf(args.pdf)
-    else:
-        pages = parse_pdf_directory(args.pdf_dir)
+    # Each PDF is its own Document (sha256 of the file bytes + filename), exactly
+    # like POST /ingest. Citations map chunk sources to Document.filename, so
+    # putting several PDFs under one Document would cite the wrong file.
 
-    if not pages:
+    # ── Step 1: Parse each PDF ──────────────────────────────────────────────
+    print("\n[1/5] Parsing PDF(s) …")
+    docs = []
+    for path in _pdf_paths(args):
+        pages = parse_pdf(str(path))
+        if not pages:
+            print(f"⚠️  No text extracted from {path.name}, skipping")
+            continue
+        docs.append({"path": path, "filename": path.name, "pages": pages,
+                     "sha256": compute_sha256(path.read_bytes())})
+    if not docs:
         print("❌ No pages extracted. Check your PDF path.")
         sys.exit(1)
 
-    # ── Step 2: Chunk ──────────────────────────────────────────────────────
-    print("\n[2/5] Chunking …")
-    chunks = chunk_pages(pages, args.chunk_tokens, args.overlap_tokens)
+    if not args.dry_run:
+        done = _already_ingested(docs)
+        for d in docs:
+            if d["sha256"] in done:
+                print(f"⏭️  {d['filename']} is already ingested (same sha256), skipping")
+        docs = [d for d in docs if d["sha256"] not in done]
+        if not docs:
+            print("\nNothing to do: every PDF is already ingested.")
+            return
 
-    # ── Step 3: LLM Entity Extraction ─────────────────────────────────────
+    print("\n[2/5] Chunking …")
+    for d in docs:
+        d["chunks"] = chunk_pages(d["pages"], args.chunk_tokens, args.overlap_tokens)
+
+    # ── Step 3: LLM Entity Extraction (all PDFs before any write) ─────────
     provider = resolve_provider(args.provider)
     print(f"\n[3/5] Extracting entities via LLM ({provider}: {model_for(provider)}) …")
     try:
-        results = extract_from_chunks(
-            chunks,
-            provider=provider,
-            use_cache=not args.no_cache,
-        )
+        for d in docs:
+            d["results"] = extract_from_chunks(
+                d["chunks"],
+                provider=provider,
+                use_cache=not args.no_cache,
+            )
     except RateLimitExhausted as e:
         print(f"\n⛔ {e}")
         print("   Nothing was written. Re-run the same command later to resume —")
@@ -117,57 +158,67 @@ def main():
         print("   Check the API key / model name for this provider in .env.")
         sys.exit(1)
 
-    # ── Step 4: Deduplicate ────────────────────────────────────────────────
+    # ── Step 4: Deduplicate (per document; shared entities merge in Neo4j) ─
     print("\n[4/5] Deduplicating …")
-    entities, relations = deduplicate(results)
-
-    # ── Step 5: Embed + Store in Qdrant ───────────────────────────────────
-    if not args.no_qdrant and not args.dry_run:
-        print("\n[5/5] Embedding chunks → Qdrant …")
-        try:
-            from ingestion.embedder import embed_chunks
-            chunks = embed_chunks(chunks)
-            load_chunks_to_qdrant(chunks)
-        except ImportError as e:
-            print(f"⚠️  Qdrant skip: {e} (install qdrant-client or use --no-qdrant)")
-    else:
-        print("\n[5/5] Skipping Qdrant (--no-qdrant or --dry-run)")
+    for d in docs:
+        d["entities"], d["relations"] = deduplicate(d["results"])
 
     # ── Optional: save JSON for inspection ────────────────────────────────
     if args.output_json:
-        out = {"entities": entities, "relations": relations}
+        out = {"entities":  [e for d in docs for e in d["entities"]],
+               "relations": [r for d in docs for r in d["relations"]]}
         with open(args.output_json, "w") as f:
             json.dump(out, f, indent=2)
         print(f"\n📄 Saved extraction to: {args.output_json}")
 
     if args.dry_run:
-        print("\n🔍 Dry run — skipping Neo4j write.")
-        print(f"   Entities extracted: {len(entities)}")
-        print(f"   Relations extracted: {len(relations)}")
+        print("\n🔍 Dry run — skipping Qdrant and Neo4j writes.")
+        print(f"   Entities extracted: {sum(len(d['entities']) for d in docs)}")
+        print(f"   Relations extracted: {sum(len(d['relations']) for d in docs)}")
         elapsed = time.time() - start
         print(f"\n⏱️  Total time: {elapsed:.1f}s")
         return
 
-    # ── Load to Neo4j ──────────────────────────────────────────────────────
-    print("\n📥 Loading to Neo4j …")
+    # ── Step 5: Embed + Qdrant, then Neo4j, one document at a time ─────────
+    print("\n[5/5] Writing to Qdrant and Neo4j …")
     try:
         with Neo4jClient() as neo4j:
             status = neo4j.verify_connection()
             print(f"   Neo4j: {status}")
 
-            counts = load_to_graph(
-                chunks             = chunks,
-                entities           = entities,
-                relations          = relations,
-                extraction_results = results,
-                client             = neo4j,
-                stage              = "base_graph",
-            )
+            for d in docs:
+                print(f"\n📥 {d['filename']}")
+                chunks = d["chunks"]
+                if not args.no_qdrant:
+                    try:
+                        from ingestion.embedder import embed_chunks
+                        chunks = embed_chunks(chunks)
+                        load_chunks_to_qdrant(chunks)
+                    except ImportError as e:
+                        print(f"⚠️  Qdrant skip: {e} (install qdrant-client or use --no-qdrant)")
 
-            print(f"   Entities:  {counts['entities']}")
-            print(f"   Relations: {counts['relations']}")
-            print(f"   Chunks:    {counts['chunks']}")
-            print(f"   Mentions:  {counts['mentions']}")
+                counts = load_to_graph(
+                    chunks             = chunks,
+                    entities           = d["entities"],
+                    relations          = d["relations"],
+                    extraction_results = d["results"],
+                    client             = neo4j,
+                    filename           = d["filename"],
+                    sha256             = d["sha256"],
+                    stage              = "base_graph",
+                )
+                register_document(
+                    sha256         = d["sha256"],
+                    filename       = d["filename"],
+                    client         = neo4j,
+                    page_count     = len(d["pages"]),
+                    entity_count   = counts["entities"],
+                    relation_count = counts["relations"],
+                )
+                print(f"   Entities:  {counts['entities']}")
+                print(f"   Relations: {counts['relations']}")
+                print(f"   Chunks:    {counts['chunks']}")
+                print(f"   Mentions:  {counts['mentions']}")
 
             neo4j.print_summary()
     except Exception as e:
