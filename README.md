@@ -5,6 +5,12 @@ from your own PDFs. It extracts drugs, diseases, symptoms, genes and their relat
 into a Neo4j knowledge graph, stores text chunks in Qdrant, and answers questions with
 citations to the exact file and page.
 
+> **About this fork.** The original project is by
+> [DongaShanmukhaSivaVenkataSai](https://github.com/DongaShanmukhaSivaVenkataSai/Medical-Graph-RAG-for-Clinical-Reasoning-),
+> whose commits are kept unchanged at the start of this history. This fork adds tests
+> and CI, Docker Compose, several correctness fixes and an answer-completeness check;
+> see [Changes in this fork](#changes-in-this-fork).
+
 Because facts from every PDF land in one shared graph, the system can answer questions
 whose answer is spread across several documents. For example, *"Which diabetes drugs
 interact with blood-pressure medications?"* needs the drug list from one PDF and the
@@ -42,13 +48,41 @@ Question ──► rewrite ──► vector search ──► spot entities ─�
 
 ## Quick start
 
-### Prerequisites
+### Option A: Docker Compose (one command)
+
+Needs Docker with Compose v2. Starts Neo4j, Qdrant, the API and the UI.
+
+```bash
+cp .env.example .env      # set NEO4J_PASSWORD (8+ chars) and one LLM key, e.g. GROQ_API_KEY
+docker compose up --build
+```
+
+| Service | URL |
+|---|---|
+| UI | http://localhost:8080 |
+| API docs | http://localhost:8000/docs |
+| Neo4j browser | http://localhost:7474 (user `neo4j`, your `NEO4J_PASSWORD`) |
+
+The backend image uses CPU-only PyTorch. The embedding and reranker models (~3 GB) are
+downloaded on first use into the `hf-models` volume, so the first query is slow and
+later ones aren't. The extraction cache lives in the `extraction-cache` volume, so
+re-ingesting a PDF costs no LLM calls. Data persists in the `neo4j-data` and
+`qdrant-data` volumes. `docker compose down -v` wipes everything.
+
+To enable the optional GDS route, add `NEO4J_PLUGINS=["graph-data-science"]` to `.env`.
+To use a local Ollama model, set `LLM_PROVIDER=ollama`; the backend reaches the host's
+Ollama at `host.docker.internal`.
+
+### Option B: run locally
+
+#### Prerequisites
 
 - Python 3.11+ and Node.js 18+
 - **Neo4j 5** on `bolt://localhost:7687` (the Graph Data Science plugin is optional)
 - **Qdrant** on `http://localhost:6333`, e.g. `docker run -p 6333:6333 qdrant/qdrant`
 - An LLM API key: Groq, Gemini or OpenAI
-### 1. Install
+
+#### 1. Install
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -56,7 +90,9 @@ pip install -r requirements.txt
 cd frontend && npm install && cd ..
 ```
 
-### 2. Configure `.env` (project root)
+#### 2. Configure `.env` (project root)
+
+Copy `.env.example` to `.env`; it lists every setting. The minimum:
 
 ```env
 NEO4J_URI=bolt://localhost:7687
@@ -70,7 +106,7 @@ GROQ_MODEL=openai/gpt-oss-120b
 GROQ_TPM=8000            # your tokens/minute limit (console.groq.com/settings/limits)
 ```
 
-### 3. Run
+#### 3. Run
 
 ```bash
 # Terminal 1 — backend (project root)
@@ -105,6 +141,7 @@ All settings live in `.env`. Only the database URLs and one LLM key are required
 | `OLLAMA_BASE_URL` / `OLLAMA_MODEL` | `localhost:11434/v1`, `llama3.1:8b` | Local model, no rate limits |
 | `EMBED_MODEL` | `BAAI/bge-base-en-v1.5` | Chunk embeddings |
 | `RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | Cross-encoder reranker |
+| `CYPHER_TIMEOUT_SECONDS` | `10` | Server-side timeout for LLM-generated Cypher |
 | `QDRANT_COLLECTION` | `medical_chunks` | Vector collection name |
 | `UMLS_API_KEY` | — | Optional UMLS identifier linking |
 
@@ -122,8 +159,9 @@ python run_stage1.py --pdf-dir data/pdfs/ --chunk-tokens 1024   # fewer LLM call
 python run_stage1.py --pdf my.pdf --dry-run --output-json out.json
 ```
 
-If the LLM quota runs out mid-run, nothing is written. Re-running the same command later
-resumes from the cache in `.cache/extractions/`.
+Each PDF becomes its own document (identified by the SHA-256 of the file), and PDFs that
+are already ingested are skipped. If the LLM quota runs out mid-run, nothing is written.
+Re-running the same command later resumes from the cache in `.cache/extractions/`.
 
 Optional Stage 2 enriches the graph with [PrimeKG](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/IXA7BM):
 
@@ -146,6 +184,32 @@ python run_stage2.py --nodes data/seed/primekg_nodes.csv --edges data/seed/prime
 curl -X POST localhost:8000/query -H 'Content-Type: application/json' \
   -d '{"question": "side efects of metformn?", "use_query_rewrite": true}'
 ```
+
+`/query` also accepts `use_completeness_check` (default `true`); the response's
+`completeness` field shows the parts it found, which were missing, and whether the
+answer was repaired. If Qdrant or Neo4j is unreachable, the API returns `503` with
+the name of the store and the setting to check.
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt     # light: no torch or models needed
+pytest                                   # 118 unit/API tests, a few seconds, no LLM or database calls
+```
+
+The LLM is replaced by a fake that returns canned JSON, and the API tests run the real
+`/query` handler with retrieval stubbed out. One integration test runs against a real
+Neo4j when you point it at one (it only touches nodes it creates):
+
+```bash
+NEO4J_TEST_URI=bolt://localhost:7687 NEO4J_TEST_PASSWORD=... pytest -k neo4j
+```
+
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs all tests
+against a Neo4j service container, lints and builds the frontend, and builds the Docker
+images.
 
 ---
 
@@ -177,6 +241,62 @@ python evaluation/make_report.py   # rebuild the PDF
 
 ---
 
+## Changes in this fork
+
+Everything below was added on top of the original commits; each item is one or two
+focused commits. Design details and trade-offs are in
+[`docs/ARCHITECTURE_NOTES.md`](docs/ARCHITECTURE_NOTES.md).
+
+| Change | Before | After |
+|---|---|---|
+| **Tests + CI** | `pytest` collected 0 tests; no CI | 119 tests (fake LLM, API tests, fake-clock rate limiter, live Neo4j test); GitHub Actions runs them, lints and builds the frontend, and builds the Docker images |
+| **Provenance across documents** (bug) | Ingesting a second PDF **overwrote** `sources` / `chunk_ids` / `pages` on shared nodes and edges; confidence drifted towards the latest PDF | Lists are unioned (plain Cypher, no APOC); confidence is the max; deleting a document removes only its provenance and Evidence |
+| **One Document per PDF in the CLI** (bug) | `run_stage1.py --pdf-dir` put all chunks under one Document named after the first PDF, so facts from the other PDFs were **cited as the wrong file** | Each PDF gets its own Document (sha256 + filename) like `POST /ingest`; already-ingested PDFs are skipped |
+| **Sub-query cleaning** (bug) | One non-string sub-query from the LLM failed validation and discarded the whole rewrite | Bad items are dropped, the rest are kept |
+| **Clear errors when a store is down** | `500 Internal Server Error` | `503` with `{"detail", "service"}` naming Qdrant or Neo4j and the setting to check |
+| **Generated-Cypher limits** | `LIMIT` checked by substring; no timeout | Query must end in a `LIMIT` (capped at 200); 10 s server-side timeout (`CYPHER_TIMEOUT_SECONDS`) |
+| **Extraction cache key** | Key was the chunk text only, so changing the model or prompt silently reused old extractions | Key includes a fingerprint of model, prompts, types, ontology and thresholds. Caches from the original code are re-extracted once |
+| **Docker Compose** | Manual Neo4j / Qdrant / Python / Node setup | `docker compose up --build` (CPU-only torch, nginx-served UI, persistent volumes) |
+| **Answer completeness check** | Multi-hop answers dropped parts of the question even though context recall was 1.0 | After the draft, an LLM check lists the question's parts; for up to 2 missing parts it retrieves more and regenerates once. +1 LLM call (+2 when repairing). Measured: detects the gap, no measurable gain yet (below) |
+
+### Measured effect of the completeness check
+
+The 3 sample PDFs were freshly ingested and the 5 multi-hop questions were answered
+with query rewriting on, first without and then with the check (same judges as the
+original evaluation). Results are in [`evaluation/results/fork/`](evaluation/results/fork/);
+the original author's results are untouched.
+
+| Multi-hop (5 questions) | Check off | Check on | Δ |
+|---|---|---|---|
+| Faithfulness | 0.80 | 1.00 | +0.20 |
+| Answer relevancy | 0.84 | 0.87 | +0.03 |
+| Context recall | 1.00 | 1.00 | 0 |
+| Answer correctness | 0.68 | 0.72 | +0.04 |
+| *Answer correctness without Q12* | *0.72* | *0.70* | *−0.02* |
+
+**Honest reading: no measurable improvement in answer correctness.**
+
+- The check changed an answer only for **Q8**. It correctly found that the answer listed
+  the empagliflozin–diuretic interaction but left out insulin/glipizide–metoprolol, and
+  it ran the repair (answer correctness 0.56 → 0.58).
+- The repair didn't add the missing fact, because that fact was **already in the
+  context** (chunks 1–2). The bottleneck is generation, not retrieval, and a second
+  search for the same part returns the same chunks.
+- For Q9–Q12 nothing was flagged, so differences there are run-to-run noise. Most of
+  the +0.04 comes from Q12, where the "off" answer happened to degenerate into ~1,800
+  zero-width characters, a one-off model glitch unrelated to the check.
+- Cost: +1 LLM call per checked question, +2 when repairing (Q8: 84 s → 180 s under
+  free-tier rate limits).
+
+With 5 questions and one run each, differences of ±0.05 are within noise. What this
+shows: the coverage check **detects** an incomplete answer, but a repair that
+re-retrieves isn't enough. The next step would be to pass the generator the *specific*
+missing item ("list every diabetes drug that interacts with a BP drug") instead of
+re-searching. Total spend for this measurement: ingestion ≈ 40k tokens, answers 76k
+(gpt-oss-120b), judging 60k (gpt-oss-20b) + 77k (qwen3).
+
+---
+
 ## Project structure
 
 ```
@@ -188,10 +308,13 @@ pipeline/                  Query rewriter, planner, entity spotter/linker, graph
 graph/                     Neo4j client, graph loader, evidence writer, document registry, GDS
 vector/                    Qdrant wrapper
 enrichment/                Stage 2 PrimeKG matching and edge import
-evaluation/                RAGAS runner, test set, report generator, results
+evaluation/                RAGAS runner, comparison script, test set, report generator, results
 frontend/                  React + Vite UI (query, upload, graph explorer, stats)
 data/pdfs/                 Sample medical PDFs and test questions
+tests/                     pytest suite (fake LLM, API tests, optional live Neo4j test)
+docs/ARCHITECTURE_NOTES.md How the pipeline works, step by step, with design trade-offs
 run_stage1.py, run_stage2.py   CLI ingestion and enrichment
+Dockerfile, docker-compose.yml, frontend/Dockerfile   Container setup
 STARTUP.md                 Detailed setup, rate-limit tuning and troubleshooting
 ```
 
@@ -204,7 +327,7 @@ STARTUP.md                 Detailed setup, rate-limit tuning and troubleshooting
 | `429` / rate limit during ingestion | Quota used up; retry later (progress is cached) or enable **Large PDF mode** |
 | `LLM provider error (401)` | API key invalid or revoked |
 | `LLM provider error (404)` | Model not available on your account; check `<PROVIDER>_MODEL` |
-| `Connection refused :7687` / `:6333` | Start Neo4j / Qdrant |
+| `503` naming Qdrant or Neo4j / `Connection refused :7687` / `:6333` | Start Neo4j / Qdrant, or check `NEO4J_URI` / `QDRANT_URL` / the Neo4j password |
 | Graph Explorer is empty | Ingest a PDF first |
 
 More in [STARTUP.md](STARTUP.md#troubleshooting).

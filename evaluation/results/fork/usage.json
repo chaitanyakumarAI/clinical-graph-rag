@@ -1,0 +1,18 @@
+{
+  "answer": {
+    "openai/gpt-oss-120b": {
+      "calls": 46,
+      "tokens": 76353
+    }
+  },
+  "judge": {
+    "openai/gpt-oss-20b": {
+      "calls": 30,
+      "tokens": 60267
+    },
+    "qwen/qwen3.8-27b": {
+      "calls": 40,
+      "tokens": 76706
+    }
+  }
+}

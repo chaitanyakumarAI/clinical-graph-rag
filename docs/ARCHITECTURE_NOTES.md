@@ -6,6 +6,9 @@ README). File references are `path:line` or `path` + function name.
 Original project by **DongaShanmukhaSivaVenkataSai**
 (github.com/DongaShanmukhaSivaVenkataSai/Medical-Graph-RAG-for-Clinical-Reasoning-).
 
+The notes describe the code **after** the fork's changes. Where the original
+behaved differently, it says so ("Before this fork: …"). §11 lists every change.
+
 ---
 
 ## 1. The system in one picture
@@ -39,7 +42,7 @@ Entry points: `POST /ingest` (`backend/main.py:424`, `ingest()`) and the CLI
 | 2 | Chunk | `ingestion/chunker.py` `chunk_pages` | Character sliding window, ~4 chars/token, default 512 tokens with 100-token overlap, **never crosses a page boundary** (so every chunk has exactly one page number). `chunk_id = md5(source_p{page}_c{idx})[:12]`. |
 | 3 | Extract | `ingestion/entity_extractor.py` `extract_from_chunks` → `extract_from_chunk` | One LLM call per chunk, JSON mode. 15 entity types, 16 relation types (prompt at `:158`). |
 | 3a | Validate | `_parse_and_validate` (`:278`) | Pydantic drops unknown entity types; unknown predicates are coerced to `RELATED_TO`. Then 4 filters: entity confidence ≥ 0.40, **entity grounding** (`_is_grounded`, `:121`: name/alias substring or all ≥4-char words present in the chunk text), relation confidence ≥ 0.50, **ontology check** (`ingestion/ontology_validator.py` `validate_triple`: domain/range per predicate, e.g. `HAS_SYMPTOM` must be Disease→Symptom). |
-| 3b | Cache | `_load_cached` / `_save_cached` (`:229-263`) | Result per chunk saved to `.cache/extractions/<sha256(text)[:16]>.json`. |
+| 3b | Cache | `_load_cached` / `_save_cached` | Result per chunk saved to `.cache/extractions/<key>.json`, where the key hashes the chunk text **and** a fingerprint of the extraction setup (see §6). |
 | 4 | Deduplicate | `ingestion/deduplicator.py` `deduplicate` | `normalize_name` (NFKC, abbreviation map `t2dm→Type 2 Diabetes`, title-case, keep short acronyms), alias merge, then rapidfuzz `ratio ≥ 90` merge. Relation endpoints are remapped to canonical names; pages/chunk_ids are unioned. |
 | 5 | Embed | `ingestion/embedder.py` `embed_chunks` | `BAAI/bge-base-en-v1.5`, L2-normalised. Queries get the BGE instruction prefix (`embed_query`). |
 | 6 | Optional ID linking | `ingestion/identifier_linker.py` | UMLS/MeSH/RxNorm IDs if `link_ids=true`. |
@@ -47,8 +50,15 @@ Entry points: `POST /ingest` (`backend/main.py:424`, `ingest()`) and the CLI
 | 8 | Write vectors | `load_chunks_to_qdrant` → `vector/qdrant_client.py` | Point id = `uuid5(chunk_id)` (idempotent), cosine distance, payload `{chunk_id, text, source, page, chunk_index}`. |
 | 9 | Register | `register_document` | Stamps the `Document` node with filename, page/entity/relation counts. Invalidates the entity-linker cache. |
 
+**One Document per PDF:** both entry points hash the file bytes, skip a PDF whose
+sha256 is already a `Document`, and write + register each PDF as its own Document.
+*Before this fork* `run_stage1.py --pdf-dir` loaded every chunk under **one**
+Document named after the first PDF (and `--pdf` never registered a sha256). Because
+`get_source_map` maps chunk sources to `Document.filename`, facts from the 2nd and 3rd
+PDF were cited as the 1st. Found while ingesting for the evaluation.
+
 **All-or-nothing:** extraction (the step that can hit rate limits) runs **before**
-anything is written. If the quota runs out, `RateLimitExhausted` propagates, the API
+anything is written (for `--pdf-dir`, for all PDFs). If the quota runs out, `RateLimitExhausted` propagates, the API
 returns 429 and Neo4j/Qdrant are untouched. Finished chunks are already cached, so
 re-uploading resumes.
 
@@ -59,9 +69,10 @@ validated with the same ontology.
 
 ## 3. Query pipeline, step by step
 
-All of this is `query()` in `backend/main.py:167`. Request model `QueryRequest`
-(`:114`): `question, provider, top_k=5, top_n=8, use_query_rewrite=True,
-use_llm_cypher=False, force_no_gds=False, min_confidence=0.5`.
+All of this is `query()` in `backend/main.py`. Request model `QueryRequest`:
+`question, provider, top_k=5, top_n=8, use_query_rewrite=True,
+use_completeness_check=True, use_llm_cypher=False, force_no_gds=False,
+min_confidence=0.5`.
 
 | Step | Code | LLM call? | Detail |
 |---|---|---|---|
@@ -75,9 +86,17 @@ use_llm_cypher=False, force_no_gds=False, min_confidence=0.5`.
 | 6. GDS | `pipeline/gds_retriever.py` `retrieve_gds_context` | no | Route-driven (see §4). Silently returns `[]` if the GDS plugin is missing. |
 | 7. Rerank | `pipeline/reranker.py` `fuse_and_rerank` (`:43`) | no | Candidates = chunks + graph path strings + GDS strings. De-dup by first 100 chars, score with cross-encoder `BAAI/bge-reranker-v2-m3` (sigmoid → 0-1), `final = 0.4·original + 0.6·rerank`, keep `top_n`. If the model can't load, every rerank score is 0.5 (degrades to original ordering). |
 | 8. Answer | `pipeline/generator.py` `generate_answer` | yes (1024 tok) | Context = structured subgraph block (`format_subgraph_for_context`, nodes + edges with `[file, p.N]` + evidence excerpts) prepended to the reranked items. Prompt rules: only use context, cite `[file.pdf, p.N]`, no graph jargon, say *"Insufficient information in the provided sources."*, end with "Sources used:". |
-| 9. Response | `main.py:324-401` | — | Builds `provenance` (documents de-duplicated by (source, page) keeping the max score; graph items carry `doc_source/doc_page/excerpt`), plus `retrieved_contexts` (exactly what the LLM saw — this is what RAGAS scores). |
+| 8b. Completeness *(fork)* | `pipeline/completeness.py` `check_coverage`, `main.py` `_repair_incomplete_answer` | yes (400 tok), +1 if repaired | Skipped for `vector_only` questions without sub-queries (`should_check`). The LLM splits the question into ≤ 4 parts (reusing the rewriter's sub-queries) and marks each covered / missing in the draft. For up to 2 missing parts: one vector search per part, the 2 best **new** chunks (de-duplicated, reranked against that part) are appended to the context, and the answer is regenerated **once** with the parts listed in the prompt (`required_parts`). Fails open: if the check errors, the draft is kept. Reported in the response as `completeness`. |
+| 9. Response | end of `query()` | — | Builds `provenance` (documents de-duplicated by (source, page) keeping the max score; graph items carry `doc_source/doc_page/excerpt`), plus `retrieved_contexts` (exactly what the LLM saw, including repair chunks — this is what RAGAS scores). |
 
-So a normal query costs **4 LLM calls** (rewrite, spot, plan, answer), 5 with LLM-Cypher.
+So a normal query costs **4 LLM calls** (rewrite, spot, plan, answer), 5 with LLM-Cypher,
+plus 1 for the completeness check (2 when it repairs) on routes other than a plain
+`vector_only`.
+
+If Qdrant or Neo4j is unreachable, exception handlers return **503** with
+`{"detail", "service"}` naming the store and the setting to check
+(`VectorStoreUnavailable`, `neo4j.exceptions.ServiceUnavailable`, `AuthError`).
+Before this fork it was a bare 500.
 
 ---
 
@@ -112,14 +131,18 @@ Only used when the request sets `use_llm_cypher=true`
 2. **Parameters, not string-building** — the LLM writes `$entity1..3` and `$limit`
    placeholders; actual entity names are passed as driver parameters, so a node named
    `"x'}) DETACH DELETE n //"` can't inject anything.
-3. **Static validator** `_is_safe_cypher` (`:79`): must start with `MATCH` /
-   `OPTIONAL MATCH` / `WITH`; whole-word regex `_WRITE_KEYWORDS` (`:73`) rejects
+3. **Static validator** `_is_safe_cypher`: must start with `MATCH` /
+   `OPTIONAL MATCH` / `WITH`; whole-word regex `_WRITE_KEYWORDS` rejects
    `CREATE DELETE DETACH MERGE SET REMOVE DROP FOREACH LOAD CSV CALL` (blocking `CALL`
-   also blocks procedures such as `apoc.*` and `dbms.*`); a `LIMIT` is injected if missing.
+   also blocks procedures such as `apoc.*` and `dbms.*`); and it must **end** with
+   `LIMIT $param` or `LIMIT n`. `_inject_limit_if_missing` appends one when there is
+   none and caps literal limits at 200 (`_MAX_LIMIT`).
 4. **Database-enforced read transaction** — `Neo4jClient.run_read_query`
-   (`graph/neo4j_client.py:393`) uses `session.execute_read`. Neo4j rejects any write
+   (`graph/neo4j_client.py`) uses `session.execute_read`. Neo4j rejects any write
    inside a READ-access transaction, so even a query that slipped past the regex can't
-   modify data.
+   modify data. The work function carries a **server-side timeout**
+   (`@unit_of_work(timeout=CYPHER_TIMEOUT_SECONDS)`, default 10 s), so a runaway
+   `[*1..10]` path query is killed by Neo4j instead of hanging the request.
 5. **Fallback** — if all candidates are unsafe/empty/fail, it falls through to the
    template strategies.
 
@@ -128,10 +151,11 @@ are relation types and labels, and those come from whitelists
 (`_validate_relations`; `NODE_LABELS` check in `/graph/explore`). Everything else is a
 parameter.
 
-**Gaps worth knowing:** no query **timeout** (a `[*1..10]` path query could run for a
-long time), the `LIMIT` check is a substring test, and the regex can reject harmless
-queries that contain e.g. a property called `set`. Layer 4 is the real guarantee;
-layer 3 is a fast first filter.
+**Before this fork:** no query timeout, and the `LIMIT` check was a substring test
+(a `LIMIT` inside a subquery or string passed). **Still true:** the regex can reject
+harmless queries that contain e.g. a property called `set`. Layer 4 is the real
+guarantee; layer 3 is a fast first filter. `tests/test_cypher_guard.py` covers
+both layers.
 
 ---
 
@@ -164,14 +188,19 @@ layer 3 is a fast first filter.
 * Reasoning models on Groq (`gpt-oss`, `qwen3`) get `reasoning_effort` low/none and
   +1024 output tokens of headroom, because hidden thinking counts against `max_tokens`.
 
-### Per-chunk extraction cache — `ingestion/entity_extractor.py:229`
-* Key = `sha256(chunk_text.strip())[:16]`; value = validated entities + relations.
-* Content-addressed: the same text in a re-upload, or in another PDF, is never paid for twice.
+### Per-chunk extraction cache — `ingestion/entity_extractor.py`
+* Key = hash of the chunk text + a **fingerprint** (`_cache_fingerprint`): sha256 of
+  the extraction model, system and user prompts, entity/relation types, the ontology
+  and the confidence thresholds, truncated to 12 chars. Value = validated entities +
+  relations (and the fingerprint, for inspection).
+* Content-addressed: the same text in a re-upload, or in another PDF, is never paid for
+  twice — as long as the extraction setup is unchanged.
 * Combined with all-or-nothing writes, an interrupted 200-chunk ingestion resumes from
   the first uncached chunk.
-* **Limitation:** the key ignores model, prompt and validation thresholds — after
-  changing `EXTRACTION_MODEL` or the prompt you must delete `.cache/` yourself, or
-  you'll silently get old results.
+* **Before this fork** the key was only `sha256(chunk_text)`, so after changing
+  `EXTRACTION_MODEL`, the prompt or a threshold you silently got the old extractions
+  unless you deleted `.cache/` yourself. Now a change produces new keys. One-time
+  cost: caches written by the original code are not reused (they're re-extracted once).
 
 ---
 
@@ -214,13 +243,22 @@ layer 3 is a fast first filter.
 * **Temp-file sources:** API uploads are parsed from a temp file, so `Chunk.source`
   and the Qdrant payload hold the temp name. `get_source_map` maps it back to
   `Document.filename` at query time; delete uses the chunk sources to purge Qdrant.
-* **Provenance overwrite (bug found in audit):** `upsert_entities_batch` and
-  `upsert_relations_batch` do `SET n.sources = row.sources`, `n.chunk_ids = …`,
-  `n.pages = …`. So ingesting a second PDF **replaces** the first PDF's
-  provenance on shared nodes and edges instead of adding to it. The comment mentions
-  an APOC fallback "without accumulation". Evidence nodes are unaffected (they're per
-  chunk), which is why intent-aware citations still work. Entity confidence is
-  `(old + new) / 2`, a running average weighted towards the latest document, not a mean.
+* **Provenance accumulates across documents** (`graph/neo4j_client.py` `_union`,
+  `_max_conf`): the upserts union `aliases`, `sources`, `chunk_ids`, `pages`,
+  `page_numbers` and `paragraph_ids` with plain Cypher
+  (`reduce(acc = [], x IN old + new | CASE WHEN x IN acc THEN acc ELSE acc + x END)`),
+  so no APOC is needed; confidence is the **max** over documents.
+  **Before this fork** (bug found in the audit) the batch upserts did
+  `SET n.sources = row.sources` etc., so ingesting a second PDF **replaced** the first
+  PDF's provenance on shared nodes and edges, and confidence was `(old + new) / 2`,
+  weighted towards the latest document. Evidence nodes were unaffected (they're per
+  chunk), which is why intent-aware citations still worked.
+* **Deleting a document** (`graph/document_registry.py` `delete_document`) now also
+  removes its provenance: Evidence nodes from its chunks are deleted, and its
+  chunk ids and sources are stripped from every shared node and edge. Entities and
+  edges themselves are kept, because on graphs built by the old code their lists are
+  incomplete, so "no sources left" doesn't reliably mean "no document supports this".
+  `tests/test_provenance.py` checks this against a live Neo4j.
 
 ---
 
@@ -239,16 +277,44 @@ Multi-hop answer correctness from the cached scores: **0.72** without rewriting,
 them. So the facts **were retrieved**, but the answer left parts out. That's the
 "answer completeness" weakness the README describes.
 
+**Fork measurement of the completeness check** (`evaluation/results/fork/`, fresh
+ingestion, rewrite on, check off → on, same judges):
+
+| Multi-hop, 5 questions | off | on |
+|---|---|---|
+| Faithfulness | 0.80 | 1.00 |
+| Answer correctness | 0.68 | 0.72 |
+| Answer correctness without Q12 | 0.72 | 0.70 |
+
+* Only **Q8** was flagged and repaired (0.56 → 0.58). The checker correctly saw that
+  insulin/glipizide–metoprolol was missing, but that fact was **already in the
+  context** (chunks 1–2), so re-retrieving for the part brought back the same
+  chunks and the regenerated answer still left it out.
+* Q9–Q12 weren't flagged; their differences are sampling noise. Q12's "off" answer
+  degenerated into ~1,800 zero-width spaces (a one-off model glitch), which is most of
+  the +0.04.
+* Conclusion: detection works, repair-by-retrieval doesn't help when the problem is
+  generation. Next: give the generator the specific missing item and the chunk that
+  holds it, or have the checker cite the supporting chunk. Run this on more than
+  5 questions before trusting any ±0.05.
+
 ---
 
 ## 9. Other things found in the audit
 
-* No tests: `test_connection.py` and `test_get_source_map.py` are scripts that need a
-  live Neo4j (`pytest` collects 0 tests). No CI.
+* *(Fixed in this fork)* No tests: `test_connection.py` and `test_get_source_map.py`
+  are scripts that need a live Neo4j (`pytest` collected 0 tests), and no CI. Now
+  `tests/` has 119 tests and `.github/workflows/ci.yml` runs them.
+* *(Fixed in this fork)* `run_stage1.py --pdf-dir` put all PDFs under one Document,
+  so citations named the wrong file (see §2).
 * `requirements.txt` uses only `>=` lower bounds, so a fresh install on 2026-11-18
   resolved fastapi 0.163 / torch 2.15 / ragas 0.4.4. Builds are not reproducible.
-* If Qdrant or Neo4j is down, `POST /query` returns a bare `500 Internal Server Error`
-  (the Qdrant connection error is unhandled) instead of a clear 503.
+  (The fork pins only the test dependencies, in `requirements-dev.txt`.)
+* *(Fixed in this fork)* If Qdrant or Neo4j was down, `POST /query` returned a bare
+  `500 Internal Server Error` instead of a clear 503.
+* *(Fixed in this fork)* The rewriter's sub-query validator ran after Pydantic's type
+  check, so one non-string item in `sub_queries` failed validation and threw away the
+  whole rewrite. It now runs in `mode="before"` and drops only the bad item.
 * No LICENSE file upstream.
 * Unauthenticated destructive endpoints (`DELETE /documents/{sha}`,
   `POST /documents/purge-legacy`) and `allow_origins=["*"]`. Fine for a local demo,
@@ -295,7 +361,9 @@ them. So the facts **were retrieved**, but the answer left parts out. That's the
    Four layers: prompt, entity names passed as parameters, a regex validator that
    whitelists the first clause and rejects write keywords and `CALL`, and execution in
    a Neo4j READ transaction (`execute_read`), where the database itself refuses writes.
-   The last one is the real guarantee. It's also opt-in (`use_llm_cypher`).
+   The last one is the real guarantee. It's also opt-in (`use_llm_cypher`). Against
+   expensive reads: every query must end in a `LIMIT` (capped at 200) and runs with a
+   10 s server-side timeout.
 
 5. **Isn't building Cypher with f-strings an injection risk?**
    Only relation types and labels go into the query text, and both come from fixed
@@ -329,8 +397,10 @@ them. So the facts **were retrieved**, but the answer left parts out. That's the
    uncached chunk. The API returns 429 with the retry time.
 
 10. **Weakness of that cache?**
-    The key is only the chunk text. Changing the model or prompt keeps serving old
-    extractions. The fix is to include model + prompt version in the key.
+    Originally the key was only the chunk text, so changing the model or prompt kept
+    serving old extractions. I added a fingerprint of everything that affects the
+    output (model, prompts, types, ontology, thresholds) to the key. Hashing the inputs
+    instead of a hand-maintained version number means nobody has to remember to bump it.
 
 11. **What does query rewriting buy you, measured?**
     On messy questions, context recall went 0.93 → 1.00 and answer correctness
@@ -357,7 +427,51 @@ them. So the facts **were retrieved**, but the answer left parts out. That's the
     completeness of the answer is the bottleneck.
 
 15. **What would you change for production?**
-    Auth on the destructive endpoints and a CORS allow-list; query timeouts; provenance
-    that accumulates across documents instead of overwriting; per-request GDS
-    projection names; streaming answers; a model-aware cache key; ingestion as a
-    background job instead of a blocking request; a larger, versioned eval set run in CI.
+    Already done in the fork: query timeouts, provenance that accumulates across
+    documents, a model-aware cache key, 503s for a missing store, tests + CI, Docker
+    Compose. Still to do: auth on the destructive endpoints and a CORS allow-list;
+    per-request GDS projection names; streaming answers; ingestion as a background job
+    instead of a blocking request; pinned runtime dependencies; a larger, versioned
+    eval set run in CI.
+
+16. **How does the completeness check work, and why that design?**
+    The eval showed recall ≈ 1.0 but low answer correctness on multi-hop questions:
+    the facts were retrieved, then a part of the question was dropped. So after the
+    draft, one cheap LLM call lists the question's parts and marks which the answer
+    covers. For up to two missing parts it does a targeted vector search, adds the two
+    best new chunks per part, and regenerates once with the parts spelled out. It's
+    bounded (no loop, at most 2 extra calls), skipped for simple definition questions,
+    fails open, and reports what it did in the response so it can be audited.
+    Measured result, honestly: it flagged the one incomplete answer (Q8) correctly,
+    but the repair didn't fix it, because the missing fact was already in the context.
+    Answer correctness didn't measurably change. That told me the bottleneck is
+    generation, not retrieval, which is a useful finding in itself.
+
+17. **How did you test code that calls an LLM and two databases?**
+    The LLM is replaced by a `FakeLLM` fixture that returns canned JSON and records
+    prompts; the API tests use FastAPI's `TestClient` with retrieval functions
+    monkeypatched; the rate limiter uses a fake clock. Cypher upserts are tested by
+    capturing the generated query, plus one integration test against a real Neo4j
+    (CI starts a Neo4j service container) that ingests two documents, checks the
+    provenance is unioned, and deletes one.
+
+---
+
+## 11. Changes in this fork (one line each, oldest first)
+
+| Commit subject | Files | Why |
+|---|---|---|
+| Ignore local virtualenv and test caches | `.gitignore` | Keep `.venv/`, `.pytest_cache/` out of git; un-ignore `.env.example` |
+| Add architecture notes | `docs/ARCHITECTURE_NOTES.md` | This file |
+| Fix sub-query cleaning | `pipeline/query_rewriter.py` | One bad item discarded the whole rewrite (found by the new tests) |
+| Add unit tests | `tests/`, `pytest.ini`, `requirements-dev.txt` | Fake LLM, fake clock, `TestClient`; no network |
+| Add GitHub Actions workflow | `.github/workflows/ci.yml` | Tests with a Neo4j service, frontend lint + build, Docker build |
+| Accumulate provenance across documents | `graph/neo4j_client.py`, `graph/document_registry.py` | Second PDF overwrote the first's sources; delete now removes only its own provenance |
+| Return 503 when a store is down | `backend/main.py`, `vector/qdrant_client.py` | Bare 500 → 503 naming Qdrant / Neo4j |
+| Trailing LIMIT + timeout for generated Cypher | `pipeline/cypher_generator.py`, `graph/neo4j_client.py` | Bound the cost of a read the LLM wrote |
+| Key the extraction cache on model and prompt | `ingestion/entity_extractor.py` | Stale extractions after a model/prompt change |
+| Docker Compose | `Dockerfile`, `docker-compose.yml`, `frontend/Dockerfile`, `frontend/nginx.conf`, `.env.example` | One-command setup |
+| Answer completeness check | `pipeline/completeness.py`, `pipeline/generator.py`, `backend/main.py` | Multi-hop answers dropped parts despite recall 1.0 (§3 step 8b) |
+| RAGAS runner targets configs / subsets | `evaluation/run_ragas.py`, `evaluation/compare.py` | Measure only what changed; keep the original results untouched |
+| One Document per PDF in the CLI | `run_stage1.py` | `--pdf-dir` cited facts from every PDF as the first PDF |
+| Measured completeness check, README | `evaluation/results/fork/`, `README.md`, this file | Before/after numbers (§8) |
