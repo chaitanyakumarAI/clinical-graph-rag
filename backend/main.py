@@ -708,6 +708,14 @@ def delete_document(sha256: str):
 
 # ── Graph exploration ─────────────────────────────────────────────────────────
 
+_EXPLORE_NODE_FIELDS = (
+    "RETURN n.name AS name, labels(n)[0] AS label, "
+    "n.confidence AS confidence, n.stage AS stage, "
+    "n.pages AS pages, n.sources AS sources, "
+    "n.umls_cui AS umls_cui, n.mesh_id AS mesh_id, n.rxnorm_id AS rxnorm_id"
+)
+
+
 @app.get("/graph/explore", response_model=GraphExploreResponse)
 def graph_explore(
     label:        Optional[str] = Query(None, description="Filter by node label"),
@@ -715,37 +723,59 @@ def graph_explore(
     min_conf:     float         = Query(0.0,  description="Min node confidence filter"),
 ):
     """Browse graph nodes and their direct relationships."""
-    # The label is inserted into the Cypher text, so only allow known labels.
+    # Unknown labels get a clear 400 instead of an empty graph.
     allowed_labels = NODE_LABELS + ["Document", "Chunk", "Evidence"]
     if label and label not in allowed_labels:
         raise HTTPException(status_code=400,
                             detail=f"Unknown label '{label}'. Valid: {', '.join(allowed_labels)}")
     neo4j = get_neo4j()
 
-    label_filter = f":{label}" if label else ""
-    conf_filter  = "WHERE n.confidence >= $min_conf" if min_conf > 0 else ""
-    node_cypher  = (
-        f"MATCH (n{label_filter}) {conf_filter} "
-        f"RETURN n.name AS name, labels(n)[0] AS label, "
-        f"n.confidence AS confidence, n.stage AS stage, "
-        f"n.pages AS pages, n.sources AS sources, "
-        f"n.umls_cui AS umls_cui, n.mesh_id AS mesh_id, n.rxnorm_id AS rxnorm_id "
-        f"LIMIT $limit"
+    # Only named entity nodes are drawn. Chunk/Document/Evidence nodes have no
+    # `name`, so without this filter they used up the node budget for nothing.
+    labels      = [label] if label else NODE_LABELS
+    conf_filter = "AND n.confidence >= $min_conf" if min_conf > 0 else ""
+    nodes = neo4j.run_query(
+        "MATCH (n) WHERE n.name IS NOT NULL AND any(l IN labels(n) WHERE l IN $labels) "
+        f"{conf_filter} {_EXPLORE_NODE_FIELDS} LIMIT $limit",
+        {"labels": labels, "limit": limit, "min_conf": min_conf},
     )
-    nodes = neo4j.run_query(node_cypher, {"limit": limit, "min_conf": min_conf})
+    names = [n["name"] for n in nodes]
 
-    edge_cypher = f"""
-    MATCH (a{label_filter})-[r]->(b)
-    WHERE r.confidence >= $min_conf
-    RETURN a.name AS source, type(r) AS relation, b.name AS target,
-           r.confidence AS confidence, r.stage AS stage,
-           r.page_numbers AS pages, r.sources AS sources
-    LIMIT $edge_limit
-    """
-    edges = neo4j.run_query(edge_cypher, {
-        "min_conf":   min_conf,
-        "edge_limit": limit * 3,
-    })
+    # Every edge must end on a node the client receives, or Cytoscape refuses
+    # to draw the graph at all. Unfiltered: edges inside the node set only.
+    # Filtered by label: also edges to neighbours, whose nodes are added below.
+    edges = neo4j.run_query(
+        """
+        MATCH (a)-[r]->(b)
+        WHERE a.name IS NOT NULL AND b.name IS NOT NULL
+          AND any(l IN labels(a) WHERE l IN $entity_labels)
+          AND any(l IN labels(b) WHERE l IN $entity_labels)
+          AND r.confidence >= $min_conf
+          AND ((a.name IN $names AND b.name IN $names)
+               OR ($with_neighbours AND (a.name IN $names OR b.name IN $names)))
+        RETURN a.name AS source, type(r) AS relation, b.name AS target,
+               r.confidence AS confidence, r.stage AS stage,
+               r.page_numbers AS pages, r.sources AS sources
+        LIMIT $edge_limit
+        """,
+        {"names": names, "entity_labels": NODE_LABELS, "min_conf": min_conf,
+         "with_neighbours": bool(label), "edge_limit": limit * 3},
+    )
+
+    known      = set(names)
+    neighbours = list(dict.fromkeys(
+        end for e in edges for end in (e["source"], e["target"]) if end not in known))
+    if label and neighbours:
+        nodes += neo4j.run_query(
+            f"MATCH (n) WHERE n.name IN $names {_EXPLORE_NODE_FIELDS}", {"names": neighbours})
+
+    # The UI uses the name as the node id, so one node per name.
+    unique = {}
+    for n in nodes:
+        unique.setdefault(n["name"], n)
+    nodes = list(unique.values())
+    known = set(unique)
+    edges = [e for e in edges if e["source"] in known and e["target"] in known]
 
     return GraphExploreResponse(nodes=nodes, edges=edges)
 
