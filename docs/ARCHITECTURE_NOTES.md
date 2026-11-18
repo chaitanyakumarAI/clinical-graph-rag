@@ -480,3 +480,4 @@ ingestion, rewrite on, check off → on, same judges):
 | UI: state across tabs, phone nav, status | `frontend/src/App.jsx`, `index.css` | No nav below 768px; answers lost on tab switch |
 | Query panel: rendered answers, completeness | `frontend/src/QueryPanel.jsx` | Raw Markdown; completeness result was returned but never shown |
 | Dashboard errors, drop zone a11y | `frontend/src/StatsDashboard.jsx`, `UploadPanel.jsx` | "0 nodes" shown when the backend was down |
+| UI redesign | `frontend/src/*`, `frontend/index.html` | Light/dark themes, new layouts; entity colour + shape in `entityTypes.js`, icons in `Icon.jsx` |
